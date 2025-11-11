@@ -19,31 +19,28 @@ from datetime import datetime
 from stable_baselines3.common.vec_env import VecNormalize
 import random
 
-# CSV LOGGING CALLBACK - Exports metrics to CSV file
-class CSVLoggingCallback(BaseCallback):
-    """
-    Callback that logs metrics to a CSV file during training.
-    """
-
+# This class uses base callback from SB3 to write the results during each training step
+class CSVLogging(BaseCallback):
     def __init__(self, csv_filename="ppo_training_log.csv", verbose=0):
         super().__init__(verbose)
         self.csv_filename = csv_filename
         self.header_written = False
         self.step_count = 0
 
-        # Create CSV file with header
+        # Create CSV file with column headers
         print(f"[CSV] Logging to: {csv_filename}")
         with open(self.csv_filename, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["Timestep", "Cost", "Reward", "Episode", "Timestamp"])
         print(f"[CSV] ✓ CSV file initialized")
 
+    # for each training step it gets the info (including costs) + the rewards
     def _on_step(self) -> bool:
         self.step_count += 1
         infos = self.locals.get('infos', [])
         rewards = self.locals.get('rewards', None)
 
-        # Defensive: if rewards is a scalar or None, wrap into list
+        # Add the rewards to a list even if the reward is None and single values
         if rewards is None:
             rewards_list = []
         else:
@@ -52,20 +49,24 @@ class CSVLoggingCallback(BaseCallback):
             except Exception:
                 rewards_list = [float(rewards)]
 
+        # Checks in each environment the info for each time stamp
         for env_idx, info in enumerate(infos):
             cost = None
             reward = None
+
+            # Check if a dictionary
             if isinstance(info, dict):
                 cost = info.get('cost', None)
+            # Skips if there is no reward and tries to convert the reward to a float
             if env_idx < len(rewards_list):
                 try:
                     reward = float(rewards_list[env_idx])
                 except Exception:
                     reward = None
-
+            # Scale the costs, because they were initially multiplied by 10000
             if cost is not None:
                 cost = cost / 10000.0
-
+            # When there is data available, the costs, rewards and additional facts are written to the excel file
             if cost is not None or reward is not None:
                 with open(self.csv_filename, "a", newline="") as f:
                     writer = csv.writer(f)
@@ -79,17 +80,14 @@ class CSVLoggingCallback(BaseCallback):
         return True
 
 
-# ============================================================
-# STEP 0: DEBUG SETUP
-# ============================================================
+
+#Checks for any immediate errors
 print("[DEBUG] Script starting...")
 sys.stdout.flush()
 
-
-# ============================================================
-# YOUR ENVIRONMENT CLASS
-# ============================================================
+# PPO Learning environment custom to Ekro's by-products facility
 class ContinuousIrregularFLPEnv(gym.Env):
+    # two render_modes are set: human if you want to visualize it, rgb_array for computational processing
     metadata = {'render_modes': ['human', 'rgb_array'], 'render_fps': 30}
 
     def __init__(self,
@@ -107,13 +105,16 @@ class ContinuousIrregularFLPEnv(gym.Env):
         self.max_steps = max_steps
         self.render_mode = render_mode
 
+        # Defining main placement areas (x, y, length, width (x and y coordinates are bottom left corner))
         self.main_area = (0, 0, 29.0, 28.82)
         self.top_right_area = (12.04, 29.1, 17.06, 10.88)
         self.mid_right_area = (29.1, 18.5, 7.9, 4.2)
 
+        # total area of the entire field (including infeasible areas)
         self.total_length = 37.0
         self.total_width = 39.98
 
+        # setting the restricted zones (x, y, length, width (x and y coordinates are bottom left corner))
         self.restricted_zones = [
             (0, 4.75, 0.5, 0.5),
             (6.18, 4.75, 0.5, 0.5),
@@ -154,7 +155,7 @@ class ContinuousIrregularFLPEnv(gym.Env):
             (0.0, 29.1, 12.04, 10.9)
         ]
 
-        # --- Load Excel data ---
+        # Loading the excel data
         if excel_data is not None:
             extracted_data = excel_data
         else:
@@ -166,48 +167,48 @@ class ContinuousIrregularFLPEnv(gym.Env):
             print("[DEBUG] Excel loaded successfully in __init__")
             sys.stdout.flush()
 
-        # Now use `extracted_data` for all your DataFrame setup
+        # Extracting the data from the Excel file
         stations_df = extracted_data["Stations"]
         high_flow_df = extracted_data["High flow matrix"]
         regular_flow_df = extracted_data["Regular flow matrix"]
         low_flow_df = extracted_data["Low flow matrix"]
         entry_points_df = extracted_data["Entry Points"]
 
-        # creating variables to link the machines of both sheets with each other
+        # Creating variables to link the machines of both sheets with each other
         station_refs = [s for s in stations_df["Number"] if str(s).startswith("S")]
         entry_refs = [idx for idx in regular_flow_df.index if str(idx).startswith("E")]
 
-        # fills all the non values with 0s in the flow matrices
+        # Incase there are non values in the flow matrices, then they are filled with 0
         def clean_flow(df):
             return df.loc[
                 [r for r in df.index if str(r).startswith(("S", "E"))],
                 [c for c in df.columns if str(c).startswith("S")]
             ].fillna(0).astype(float)
 
-        # set the flow clean flow matrices
+        # Set the flow matrices
         flow_high_df = clean_flow(high_flow_df)
         flow_regular_df = clean_flow(regular_flow_df)
         flow_low_df = clean_flow(low_flow_df)
 
-        # Store the flow scenarios as a dictionary
+        # Store the flow scenarios as a dictionary with according weights
         self.flow_scenarios = {
             "high": {"matrix": flow_high_df, "weight": 1 / 12},
             "regular": {"matrix": flow_regular_df, "weight": 9 / 12},
             "low": {"matrix": flow_low_df, "weight": 2 / 12}, }
 
-        # set default flow matrix to regular
+        # Set default flow matrix to regular
         self.flow_matrix = flow_regular_df
         self.fixed_scenario = fixed_scenario
 
-        # Store the station and entry references of the excel sheets: E.g. E0 and S0
+        # Store the station and entry references of the excel sheets: E.g. S0 and E0
         self.station_references = station_refs
         self.entry_references = entry_refs
 
-        # set dimensions
+        # Set the dimensions of machines and how many machines there are
         self.machine_dimensions = stations_df[["Length", "Width"]].values.tolist()
         self.n_facilities = len(station_refs)
 
-        # setting the product flow entry point coordinates from the excel file
+        # Setting the product flow entry point coordinates from the excel file
         self.entry_points_coordinates = {}
         for _, row in entry_points_df.iterrows():
             entry_point = row["EntryPoint"]
@@ -217,15 +218,16 @@ class ContinuousIrregularFLPEnv(gym.Env):
             # format the entry point dictionary to Station: {entry point, flow}
             self.entry_points_coordinates[entry_point] = (x, y)
 
-        # S8-S11 are seperate parts of the packaging machines. Creating an additional parameter for close placement
-        self.connected_line = [8, 9, 10, 11]
-        self.connected_line_spacing = 0.0
-
-        # system exit points: when by-products leave the department to storage/customer (two doors they could leave through)
+        # Setting the system exit points: when by-products leave the department to storage/customer (two doors they could leave through)
         self.exit_points = {
             "Exit1": {"x": 0.0, "y": 12.5},
             "Exit2": {"x": 0.0, "y": 26.4},
         }
+
+        # S8-S11 were separated into parts of the packaging machines. Creating an additional parameter for close placement
+        self.connected_line = [8, 9, 10, 11]
+        self.connected_line_spacing = 0.0
+
         # creating the action space dictionary, because facilityID is discrete and placement should be continuous
         # both x and y coordinates of the facilities can be moved in a continuous action space ranging from -1 until 1
         # agent can choose whether to not rotate = 0 or rotate = 1
@@ -270,6 +272,7 @@ class ContinuousIrregularFLPEnv(gym.Env):
         def inside_mid_right(px, py):
             return 29.1 <= px <= 37 and 18.5 <= py <= 22.7
 
+        # if the corners are placed outside the areas, they return False
         corners = [(x, y), (x + l, y), (x, y + w), (x + l, y + w)]
         for (px, py) in corners:
             if not (inside_main(px, py) or inside_top_right(px, py) or inside_mid_right(px, py)):
@@ -286,10 +289,6 @@ class ContinuousIrregularFLPEnv(gym.Env):
 
     # combining previous function and determining whether the placement is valid or not
     def _is_valid_placement(self, x, y, length, width, facility_id, layout=None):
-        """
-        Check placement inside allowed areas, not in restricted zones, and no overlap.
-        layout entries are canonical: (x, y, length, width, orientation)
-        """
         if not self._is_in_irregular_area(x, y, length, width):
             return False
         if self._is_in_restricted_zone(x, y, length, width):
@@ -302,28 +301,28 @@ class ContinuousIrregularFLPEnv(gym.Env):
             if other_id == facility_id:
                 continue
 
-            # Determine display dimensions of other facility
+            # Determine display dimensions of other workstation
             if o_orientation == 1:
                 other_display_length, other_display_width = ow, ol
             else:
                 other_display_length, other_display_width = ol, ow
 
-            # Axis-aligned rectangle overlap test
+            # Check overlap with other workstation
             if not (x + length <= ox or ox + other_display_length <= x or
                     y + width <= oy or oy + other_display_width <= y):
                 return False
 
         return True
 
-    # this function calculates the distances of all machines on average to restricted zones
-    # needs to be as low as possible
+    # This function calculates the distances of all machines on average to restricted zones
+    # Needs to be as low as possible
     def _calculate_proximity_to_restricted_areas(self):
-        rz = np.array(self.restricted_zones)  # shape (N_zones, 4)
-        total_distance = 0.0
-        for fid, (x, y, length, width, orientation) in self.current_layout.items():
-            # compute display dims
+        rz = np.array(self.restricted_zones)  # Array of the restricted zones
+        total_distance = 0.0 # Variable for summing the total distances
+        for fid, (x, y, length, width, orientation) in self.current_layout.items(): # loop over the workstations
+            # Compute display dimensions. When the workstation is turned (orientation == 1), the width and length are switched
             dl, dw = (width, length) if orientation == 1 else (length, width)
-            cx, cy = x + dl / 2.0, y + dw / 2.0
+            cx, cy = x + dl / 2.0, y + dw / 2.0 # Calculating the centres of the placed facilities
 
             # distances to each restricted zone
             closest_xs = np.clip(cx, rz[:, 0], rz[:, 0] + rz[:, 2])
@@ -331,7 +330,7 @@ class ContinuousIrregularFLPEnv(gym.Env):
             dists = np.sqrt((cx - closest_xs) ** 2 + (cy - closest_ys) ** 2)
             min_dist = np.min(dists)
             total_distance += float(min_dist)
-
+        # when there are no machines placed, infinity will be given to cause an error
         if len(self.current_layout) == 0:
             return float('inf')
         avg_distance = total_distance / len(self.current_layout)
@@ -343,11 +342,13 @@ class ContinuousIrregularFLPEnv(gym.Env):
         max_retries = 1000
 
         # The following lines make sure that S8-S11 are placed relatively close to each other
-        bbox_margin = 3.0  # maximum distance allowed between consecutive machines
-        # total_l and total_w sums the total length and width of the selected machines
+        bbox_margin = 2.0  # maximum distance allowed between consecutive machines
+
+        # Total_l and total_w sums the total length and width of the selected machines
         total_l = sum(self.machine_dimensions[fid][0] for fid in self.connected_line)
         total_w = sum(self.machine_dimensions[fid][1] for fid in self.connected_line)
-        # makes sure the entire line is not longer than the total area length and width
+
+        # Makes sure the entire line is not longer than the total area length and width
         line_bbox_l = min(self.total_length, total_l + bbox_margin * (len(self.connected_line) - 1))
         line_bbox_w = min(self.total_width, total_w + bbox_margin * (len(self.connected_line) - 1))
 
@@ -381,7 +382,7 @@ class ContinuousIrregularFLPEnv(gym.Env):
             if not placed:
                 raise RuntimeError(f"Failed to place connected facility {fid} after {max_retries} attempts.")
 
-        # --- Place remaining machines ---
+        # Place remaining machines
         for i in range(self.n_facilities):
             if i in self.connected_line:
                 continue  # already placed
@@ -445,7 +446,7 @@ class ContinuousIrregularFLPEnv(gym.Env):
         if rotate == 1:
             orientation = 1 - orientation
 
-        # Get CURRENT dimensions based on orientation (computed, not stored)
+        # Get the current dimensions based on orientation (computed, not stored)
         if orientation == 1:
             l, w = orig_width, orig_length  # Swapped
         else:
@@ -454,7 +455,7 @@ class ContinuousIrregularFLPEnv(gym.Env):
         new_x = np.clip(x + dx, 0, self.total_length - l)
         new_y = np.clip(y + dy, 0, self.total_width - w)
 
-        # Create temporary layout - ALWAYS store original dimensions!
+        # Create temporary layout
         temp_layout = self.current_layout.copy()
         temp_layout[facility_id] = (new_x, new_y, orig_length, orig_width, orientation)
 
@@ -476,7 +477,7 @@ class ContinuousIrregularFLPEnv(gym.Env):
                 prev_fid = self.connected_line[i - 1]
                 px, py, pw, ph, po = self.current_layout[prev_fid]
                 pw_disp, ph_disp = (ph, pw) if po == 1 else (pw, ph)
-                # Place next machine adjacent horizontally
+                # Place next machine adjacent
                 self.current_layout[next_fid] = (px + pw_disp + self.connected_line_spacing,
                                                  py,
                                                  self.machine_dimensions[next_fid][0],
@@ -506,40 +507,56 @@ class ContinuousIrregularFLPEnv(gym.Env):
     def _calculate_material_handling_cost(self):
         total_cost = 0.0
 
-        # Get all layout positions for stations
+        # Get layout positions for all stations
         station_positions = {
             s: self.current_layout[i] for i, s in enumerate(self.station_references)
             if i in self.current_layout
         }
 
-        # Iterate over all flows (E→S and S↔S)
         for source in self.flow_matrix.index:
             for target in self.flow_matrix.columns:
                 flow = self.flow_matrix.loc[source, target]
                 if flow <= 0:
                     continue
 
-                # Source coordinates
-                if str(source).startswith("E"):  # Entry point source
+                # --- SOURCE COORDINATES ---
+                if str(source).startswith("E"):  # Entry point
                     if source not in self.entry_points_coordinates:
-                        continue  # skip missing entry
+                        continue
                     sx, sy = self.entry_points_coordinates[source]
-                elif str(source).startswith("S"):  # Station source
+
+                elif str(source).startswith("S"):  # Station
                     if source not in station_positions:
                         continue
                     sx, sy = station_positions[source][0:2]
+
                 else:
-                    continue  # skip unknown labels
+                    continue  # Unknown source type
 
-                # Target coordinates
-                if target not in station_positions:
+                # --- TARGET COORDINATES ---
+                # Case 1: target is another station
+                if str(target).startswith("S"):
+                    if target not in station_positions:
+                        continue
+                    tx, ty = station_positions[target][0:2]
+
+                # Case 2: source is S11 → nearest exit (automatic)
+                elif str(source) in ["11", "s11"]:
+                    # find nearest exit to S11
+                    nearest_exit, min_dist = None, float("inf")
+                    for exit_name, exit_data in self.exit_points.items():
+                        ex, ey = exit_data["x"], exit_data["y"]
+                        dist = abs(sx - ex) + abs(sy - ey)
+                        if dist < min_dist:
+                            nearest_exit, min_dist = exit_name, dist
+                    tx, ty = self.exit_points[nearest_exit]["x"], self.exit_points[nearest_exit]["y"]
+
+                # Case 3: any other station sending to exit → ignore
+                else:
                     continue
-                tx, ty = station_positions[target][0:2]
 
-                # Compute Manhattan distance
+                # --- DISTANCE & COST ---
                 dist = abs(sx - tx) + abs(sy - ty)
-
-                # Add cost
                 total_cost += flow * dist
 
         return total_cost
@@ -548,7 +565,7 @@ class ContinuousIrregularFLPEnv(gym.Env):
     def _check_conveyor_connectivity(self, layout=None):
         if layout is None:
             layout = self.current_layout
-        max_distance = 3.0  # allowable distance between consecutive machines
+        max_distance = 2.0  # allowable distance between consecutive machines
         for i in range(len(self.connected_line) - 1):
             fid1 = self.connected_line[i]
             fid2 = self.connected_line[i + 1]
@@ -762,10 +779,10 @@ sys.stdout.flush()
 
 try:
     # Create both callbacks: TensorBoard + CSV
-    csv_callback = CSVLoggingCallback(csv_filename="ppo_training_log23.csv")
+    csv_callback = CSVLogging(csv_filename="ppo_training_log40.csv")
 
     model.learn(
-        total_timesteps=250000,
+        total_timesteps=4000,
         callback=csv_callback,
         log_interval=10
     )
@@ -813,7 +830,7 @@ except Exception as e:
     raise
 
 
-def test_on_scenario(scenario_name, num_episodes=160, max_steps=200):
+def test_on_scenario(scenario_name, num_episodes=10, max_steps=200):
     """
     Test the trained model on a specific flow scenario.
     Returns a sorted list of results by final_cost (ascending).
@@ -869,7 +886,7 @@ def test_on_scenario(scenario_name, num_episodes=160, max_steps=200):
 
 # Test on regular flow scenario
 # Run 160 episodes
-regular_flow_results = test_on_scenario("regular", num_episodes=160, max_steps=200)
+regular_flow_results = test_on_scenario("regular", num_episodes=10, max_steps=200)
 
 # Statistical summary
 costs = [r['final_cost'] for r in regular_flow_results]
