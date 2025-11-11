@@ -28,11 +28,11 @@ class CSVLogging(BaseCallback):
         self.step_count = 0
 
         # Create CSV file with column headers
-        print(f"[CSV] Logging to: {csv_filename}")
+        print(f"Logging to: {csv_filename}")
         with open(self.csv_filename, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["Timestep", "Cost", "Reward", "Episode", "Timestamp"])
-        print(f"[CSV] ✓ CSV file initialized")
+        print(f"CSV file initialized")
 
     # for each training step it gets the info (including costs) + the rewards
     def _on_step(self) -> bool:
@@ -341,70 +341,88 @@ class ContinuousIrregularFLPEnv(gym.Env):
         layout = {}
         max_retries = 1000
 
-        # The following lines make sure that S8-S11 are placed relatively close to each other
-        bbox_margin = 2.0  # maximum distance allowed between consecutive machines
+        # Connected packaging line constraint
+        # Place connected line S8-S11
+        max_initial_spacing = 2.0  # preferred distance
+        max_expand_spacing = 6.0  # maximum allowed distance if initial fails
+        prev_fid = self.connected_line[0]
 
-        # Total_l and total_w sums the total length and width of the selected machines
-        total_l = sum(self.machine_dimensions[fid][0] for fid in self.connected_line)
-        total_w = sum(self.machine_dimensions[fid][1] for fid in self.connected_line)
+        # Place first machine freely
+        l, w = self.machine_dimensions[prev_fid]
+        orientation = self.rng.integers(0, 2)
+        layout[prev_fid] = (
+            self.rng.uniform(0, self.total_length - l),
+            self.rng.uniform(0, self.total_width - w),
+            l, w, orientation
+        )
 
-        # Makes sure the entire line is not longer than the total area length and width
-        line_bbox_l = min(self.total_length, total_l + bbox_margin * (len(self.connected_line) - 1))
-        line_bbox_w = min(self.total_width, total_w + bbox_margin * (len(self.connected_line) - 1))
+        # Place remaining connected machines
+        for idx in range(1, len(self.connected_line)):
+            fid = self.connected_line[idx]
+            l, w = self.machine_dimensions[fid]
 
-        # Random origin of the connected line bounding box
-        box_x = self.rng.uniform(0, self.total_length - line_bbox_l)
-        box_y = self.rng.uniform(0, self.total_width - line_bbox_w)
-
-        for idx, fid in enumerate(self.connected_line):
-            orig_l, orig_w = self.machine_dimensions[fid]
             placed = False
+            for spacing in np.linspace(max_initial_spacing, max_expand_spacing, num=5):
+                directions = ["right", "left", "up", "down"]
+                self.rng.shuffle(directions)
 
-            for _ in range(max_retries):
-                # Place each machine randomly inside the bounding box
-                x = self.rng.uniform(box_x, min(box_x + line_bbox_l - orig_l, self.total_length - orig_l))
-                y = self.rng.uniform(box_y, min(box_y + line_bbox_w - orig_w, self.total_width - orig_w))
+                for direction in directions:
+                    prev_x, prev_y, prev_l, prev_w, prev_o = layout[self.connected_line[idx - 1]]
+                    prev_disp_l, prev_disp_w = (prev_w, prev_l) if prev_o == 1 else (prev_l, prev_w)
 
-                # check the orientation
-                for orientation in [0, 1]:
-                    w, h = (orig_w, orig_l) if orientation == 1 else (orig_l, orig_w)
-                    temp_layout = layout.copy()
-                    temp_layout[fid] = (x, y, orig_l, orig_w, orientation)
-                    # check whether it is a valid placement
-                    if self._is_valid_placement(x, y, w, h, fid, temp_layout):
-                        layout[fid] = (x, y, orig_l, orig_w, orientation)
+                    orientation = self.rng.integers(0, 2)
+                    disp_l, disp_w = (w, l) if orientation == 1 else (l, w)
+
+                    if direction == "right":
+                        nx, ny = prev_x + prev_disp_l + spacing, prev_y + self.rng.uniform(-0.5, 0.5)
+                    elif direction == "left":
+                        nx, ny = prev_x - disp_l - spacing, prev_y + self.rng.uniform(-0.5, 0.5)
+                    elif direction == "up":
+                        nx, ny = prev_x + self.rng.uniform(-0.5, 0.5), prev_y + prev_disp_w + spacing
+                    else:  # down
+                        nx, ny = prev_x + self.rng.uniform(-0.5, 0.5), prev_y - disp_w - spacing
+
+                    # Clip to bounds
+                    nx = np.clip(nx, 0, self.total_length - disp_l)
+                    ny = np.clip(ny, 0, self.total_width - disp_w)
+
+                    # Validate
+                    if self._is_valid_placement(nx, ny, disp_l, disp_w, fid, layout):
+                        layout[fid] = (nx, ny, l, w, orientation)
                         placed = True
                         break
-
                 if placed:
                     break
-
             if not placed:
-                raise RuntimeError(f"Failed to place connected facility {fid} after {max_retries} attempts.")
-
-        # Place remaining machines
-        for i in range(self.n_facilities):
-            if i in self.connected_line:
-                continue  # already placed
-
-            orig_l, orig_w = self.machine_dimensions[i]
-            placed = False
-
-            for _ in range(max_retries):
-                x = self.rng.uniform(0, self.total_length - orig_l)
-                y = self.rng.uniform(0, self.total_width - orig_w)
-
-                for orientation in [0, 1]:
-                    l, w = (orig_w, orig_l) if orientation == 1 else (orig_l, orig_w)
-                    temp_layout = layout.copy()
-                    temp_layout[i] = (x, y, orig_l, orig_w, orientation)
-
-                    if self._is_valid_placement(x, y, l, w, i, temp_layout):
-                        layout[i] = (x, y, orig_l, orig_w, orientation)
+                # last resort: place anywhere valid
+                for _ in range(50):
+                    nx = self.rng.uniform(0, self.total_length - l)
+                    ny = self.rng.uniform(0, self.total_width - w)
+                    orientation = self.rng.integers(0, 2)
+                    disp_l, disp_w = (w, l) if orientation == 1 else (l, w)
+                    if self._is_valid_placement(nx, ny, disp_l, disp_w, fid, layout):
+                        layout[fid] = (nx, ny, l, w, orientation)
                         placed = True
                         break
+            if not placed:
+                raise RuntimeError(f"Failed to place connected machine {fid} after multiple attempts.")
 
-                if placed:
+        # Now place remaining stations as usual
+        for i in range(self.n_facilities):
+            if i in self.connected_line:
+                continue
+
+            l, w = self.machine_dimensions[i]
+            placed = False
+            for _ in range(max_retries):
+                x = self.rng.uniform(0, self.total_length - l)
+                y = self.rng.uniform(0, self.total_width - w)
+                orientation = self.rng.integers(0, 2)
+                disp_l, disp_w = (w, l) if orientation == 1 else (l, w)
+
+                if self._is_valid_placement(x, y, disp_l, disp_w, i, layout):
+                    layout[i] = (x, y, l, w, orientation)
+                    placed = True
                     break
 
             if not placed:
@@ -471,18 +489,15 @@ class ContinuousIrregularFLPEnv(gym.Env):
         # check whether the box and bucket line are closely placed
         if facility_id in self.connected_line:
             idx = self.connected_line.index(facility_id)
-            # Move all following machines relative to this one
-            for i in range(idx + 1, len(self.connected_line)):
-                next_fid = self.connected_line[i]
-                prev_fid = self.connected_line[i - 1]
-                px, py, pw, ph, po = self.current_layout[prev_fid]
-                pw_disp, ph_disp = (ph, pw) if po == 1 else (pw, ph)
-                # Place next machine adjacent
-                self.current_layout[next_fid] = (px + pw_disp + self.connected_line_spacing,
-                                                 py,
-                                                 self.machine_dimensions[next_fid][0],
-                                                 self.machine_dimensions[next_fid][1],
-                                                 self.current_layout[next_fid][4])
+            # Move all subsequent machines relative to this one
+            dx, dy = np.clip(action['move'], -1.0, 1.0)
+            for i in range(idx, len(self.connected_line)):
+                fid = self.connected_line[i]
+                x, y, l, w, o = self.current_layout[fid]
+                nx = np.clip(x + dx, 0, self.total_length - l)
+                ny = np.clip(y + dy, 0, self.total_width - w)
+                # Keep orientation unchanged
+                self.current_layout[fid] = (nx, ny, l, w, o)
 
         # Reward calculation
         cost = self._calculate_material_handling_cost()
@@ -519,7 +534,7 @@ class ContinuousIrregularFLPEnv(gym.Env):
                 if flow <= 0:
                     continue
 
-                # --- SOURCE COORDINATES ---
+                # Set the coordinates of the product source locations
                 if str(source).startswith("E"):  # Entry point
                     if source not in self.entry_points_coordinates:
                         continue
@@ -533,14 +548,13 @@ class ContinuousIrregularFLPEnv(gym.Env):
                 else:
                     continue  # Unknown source type
 
-                # --- TARGET COORDINATES ---
-                # Case 1: target is another station
+                # Inter-station product flow
                 if str(target).startswith("S"):
                     if target not in station_positions:
                         continue
                     tx, ty = station_positions[target][0:2]
 
-                # Case 2: source is S11 → nearest exit (automatic)
+                # S11 → nearest exit
                 elif str(source) in ["11", "s11"]:
                     # find nearest exit to S11
                     nearest_exit, min_dist = None, float("inf")
@@ -551,17 +565,16 @@ class ContinuousIrregularFLPEnv(gym.Env):
                             nearest_exit, min_dist = exit_name, dist
                     tx, ty = self.exit_points[nearest_exit]["x"], self.exit_points[nearest_exit]["y"]
 
-                # Case 3: any other station sending to exit → ignore
                 else:
                     continue
 
-                # --- DISTANCE & COST ---
+                # Cost calculation based on distance
                 dist = abs(sx - tx) + abs(sy - ty)
                 total_cost += flow * dist
 
         return total_cost
 
-    # check whether the distance between the parts of the packaging conveyor are max 3m placed apart
+    # check whether the distance between the parts of the packaging conveyor are max 2m placed apart
     def _check_conveyor_connectivity(self, layout=None):
         if layout is None:
             layout = self.current_layout
@@ -586,11 +599,11 @@ class ContinuousIrregularFLPEnv(gym.Env):
         return True
     # checks the entire layout based on valid placements
     def _check_valid_layout(self):
-        # Validate each placement by passing canonical length,width
+        # Validate each placement by passing length,width
         for fid, (x, y, length, width, orientation) in self.current_layout.items():
             if not self._is_valid_placement(x, y, length, width, fid, self.current_layout):
                 return False
-        # Check conveyor connectivity once
+        # Check conveyor connectivity
         if not self._check_conveyor_connectivity(self.current_layout):
             return False
         return True
@@ -628,8 +641,8 @@ class ContinuousIrregularFLPEnv(gym.Env):
         ax.fill(irregular_outline[:, 0], irregular_outline[:, 1], color='lightgray', alpha=0.3)
 
         # Draw restricted zones
-        for (rx, ry, rw, rh) in self.restricted_zones:
-            rect = Rectangle((rx, ry), rw, rh, color='red', alpha=0.5)
+        for (rx, ry, rl, rw) in self.restricted_zones:
+            rect = Rectangle((rx, ry), rl, rw, color='red', alpha=0.5)
             ax.add_patch(rect)
 
         # Draw facilities with orientation
@@ -650,12 +663,13 @@ class ContinuousIrregularFLPEnv(gym.Env):
             cx, cy = x + display_length / 2.0, y + display_width / 2.0
             ax.text(cx, cy, str(fid), ha='center', va='center',
                     fontsize=10, color='black', fontweight='bold')
-
+        # setting x, y axis of the figure
         ax.set_xlim(-1, self.total_length + 1)
         ax.set_ylim(-1, self.total_width + 1)
         ax.set_aspect('equal')
         ax.set_title(f"Irregular Layout - Step {self.step_count}")
 
+        # When mode is set to rgb, the programme will internally draw rgb images that will be automatically closed again for computational reasons
         if self.render_mode == "rgb_array":
             fig.canvas.draw()
             img = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
@@ -663,23 +677,27 @@ class ContinuousIrregularFLPEnv(gym.Env):
             plt.close(fig)
             return img[:, :, :3]
 
+        # When mode is set to human, the plots will be graphically presented to the user until it is manually closed
         elif self.render_mode == "human":
             plt.show()
             return None
 
-
+# This class makes sure that the environment is made compatible to be used by the PPO agent
 class PPOCompatibleEnv(gym.Env):
     def __init__(self, env):
         super().__init__()
         self.env = env
         self.observation_space = env.observation_space
+
         # flatten: [facility_id, dx, dy, rotate]
         self.action_space = spaces.Box(low=np.array([0, -1, -1, 0]), high=np.array([env.n_facilities - 1, 1, 1, 1]),
                                        dtype=np.float32)
 
+    # Makes sure that all the keyword arguments from reset function are used again
     def reset(self, **kwargs):
         return self.env.reset(**kwargs)
 
+    # All the actions are clipped so that they are compatible with the PPO agent
     def step(self, action):
         # Clip and round actions to valid values
         facility_id = int(np.clip(np.round(action[0]), 0, self.env.n_facilities - 1))
@@ -688,29 +706,29 @@ class PPOCompatibleEnv(gym.Env):
         dict_action = {'facility_id': facility_id, 'move': np.array([dx, dy]), 'rotate': rotate}
         return self.env.step(dict_action)
 
+    # Uses the previously defined render function
     def render(self):
         return self.env.render()
 
 
-print("[STEP 1] Loading Excel data...")
+print("[1] Loading Excel data...")
 sys.stdout.flush()
 
+# Call filepath again
 filepath = "C:\\Users\\beunk\\Downloads\\Bij-producten meta data.xlsx"
 
 try:
     shared_data = data_loader(filepath).excel_file_loading()
-    print(f"[STEP 1] ✓ Excel data loaded successfully!")
-    print(f"[STEP 1] Keys in data: {list(shared_data.keys())}")
+    print(f"[2] Excel data successfully loaded.")
+    print(f"[3] Loaded Excel sheets: {list(shared_data.keys())}")
     sys.stdout.flush()
 except Exception as e:
     print(f"[ERROR] Failed to load Excel: {e}")
     sys.stdout.flush()
     raise
 
-# ============================================================
-# STEP 2: ENVIRONMENT FACTORY (No duplicate loading!)
-# ============================================================
-print("[STEP 2] Creating environment factory...")
+# Loading environment
+print("[4] Loading predefined environment.")
 sys.stdout.flush()
 
 
@@ -727,20 +745,18 @@ def make_env():
     return PPOCompatibleEnv(base_env)
 
 
-print("[STEP 2] ✓ Environment factory created")
+print("[5] Predefined environment loaded.")
 sys.stdout.flush()
 
-# ============================================================
-# STEP 3: CREATE VECTORIZED ENVIRONMENT
-# ============================================================
-print("[STEP 3] Creating 4 vectorized environments...")
+
+# Create dummy environments
+print("[6] Creating 2 vectorized dummy environments.")
 sys.stdout.flush()
 
 try:
-    print("[STEP 3] Creating 3 DummyVecEnv environments...")
     vec_env = DummyVecEnv([make_env for _ in range(2)])
     vec_env = VecNormalize(vec_env, norm_obs=False, norm_reward=True, clip_reward=1.0) # type: ignore
-    print("[STEP 3] ✓ DummyVecEnv created!")
+    print("[7] Dummy Environments created")
     sys.stdout.flush()
 except Exception as e:
     print(f"[ERROR] Failed to create vectorized environment: {e}")
@@ -748,8 +764,8 @@ except Exception as e:
     raise
 
 
-# STEP 4: CREATE PPO AGENT
-print("[STEP 4] Creating PPO model...")
+# Call the PPO model with affiliated hyperparameters
+print("[8] Creating PPO model.")
 sys.stdout.flush()
 
 try:
@@ -765,41 +781,40 @@ try:
         clip_range=0.3,
         ent_coef=0.005
     )
-    print("[STEP 4] ✓ PPO model created successfully!")
+    print("[9] PPO model successfully created")
     sys.stdout.flush()
 except Exception as e:
     print(f"[ERROR] Failed to create PPO model: {e}")
     sys.stdout.flush()
     raise
 
-# STEP 5: TRAIN THE MODEL WITH CSV LOGGING
-print("[STEP 5] Starting training")
-print("[STEP 5] Logging to: ppo_training_log.csv")
+# Training of the model
+print("[10] Starting training")
+print("[11] Training results will be logged to: ppo_training_log##.csv")
 sys.stdout.flush()
 
 try:
-    # Create both callbacks: TensorBoard + CSV
-    csv_callback = CSVLogging(csv_filename="ppo_training_log40.csv")
+    csv_callback = CSVLogging(csv_filename="ppo_training_log42.csv")
 
     model.learn(
-        total_timesteps=4000,
+        total_timesteps=100, # Important for how long you want to train the model for
         callback=csv_callback,
         log_interval=10
     )
-    print("[STEP 5] ✓ Training completed!")
+    print("[12] Model was trained succesful")
     sys.stdout.flush()
 except Exception as e:
     print(f"[ERROR] Training failed: {e}")
     sys.stdout.flush()
     raise
 
-# STEP 6: SAVE THE MODEL
-print("[STEP 6] Saving trained model...")
+# Saving of the model on the internal drive
+print("[13] Saving trained model on internal drive")
 sys.stdout.flush()
 
 try:
     model.save("ppo_flp_agent")
-    print("[STEP 6] ✓ Model saved as 'ppo_flp_agent'")
+    print("[14] Model saved as 'ppo_flp_agent'")
     sys.stdout.flush()
 except Exception as e:
     print(f"[ERROR] Failed to save model: {e}")
@@ -807,35 +822,31 @@ except Exception as e:
     raise
 
 print("\n" + "=" * 60)
-print("TRAINING COMPLETE!")
+print("Training is completed")
 print("=" * 60)
 print("\n📊 Results saved to:")
-print("  ✓ ppo_training_log.csv (metrics at each step)")
+print("  ✓ ppo_training_log##.csv")
 print("=" * 60)
 
-# PHASE 2: TESTING ON DIFFERENT FLOW SCENARIOS
+# testing the trained model
 print("\n" + "=" * 60)
-print("PHASE 2: TESTING ON HIGH AND LOW FLOW SCENARIOS")
+print("[15] Initiating the testing phase of the trained model.")
 print("=" * 60)
 
 # Load the trained model
-print("[TEST] Loading trained model...")
+print("[16] Loading trained model")
 try:
     model = PPO.load("ppo_flp_agent")
-    print("[TEST] ✓ Model loaded successfully!")
+    print("[17] Model loaded successfully.")
     sys.stdout.flush()
 except Exception as e:
     print(f"[ERROR] Failed to load model: {e}")
     sys.stdout.flush()
     raise
 
-
+# test the model based on the scenario: num_episodes important as to how many times the model is tested
 def test_on_scenario(scenario_name, num_episodes=10, max_steps=200):
-    """
-    Test the trained model on a specific flow scenario.
-    Returns a sorted list of results by final_cost (ascending).
-    """
-    print(f"\n[TEST] Testing on '{scenario_name}' flow scenario ({num_episodes} episodes)...")
+    print(f"\n[18] Testing on '{scenario_name}' flow scenario ({num_episodes} episodes)...")
     sys.stdout.flush()
 
     stations_df = shared_data["Stations"]
@@ -874,7 +885,7 @@ def test_on_scenario(scenario_name, num_episodes=10, max_steps=200):
         })
 
         if (episode + 1) % 20 == 0:
-            print(f"[TEST] Episode {episode + 1}/{num_episodes} completed.")
+            print(f"[19] Episode {episode + 1}/{num_episodes} completed.")
             sys.stdout.flush()
 
     test_env.close()
@@ -885,32 +896,28 @@ def test_on_scenario(scenario_name, num_episodes=10, max_steps=200):
 
 
 # Test on regular flow scenario
-# Run 160 episodes
 regular_flow_results = test_on_scenario("regular", num_episodes=10, max_steps=200)
 
 # Statistical summary
 costs = [r['final_cost'] for r in regular_flow_results]
 rewards = [r['total_reward'] for r in regular_flow_results]
 
-print("\n📊 Statistical Summary (Regular Flow Scenario):")
+print("\n [20]Statistical Summary:")
 print(f"Costs (in millions): Mean = {np.mean(costs)/1_000_000:.2f}, Median = {np.median(costs)/1_000_000:.2f}, "
       f"Std = {np.std(costs)/1_000_000:.2f}, Min = {np.min(costs)/1_000_000:.2f}, Max = {np.max(costs)/1_000_000:.2f}")
 print(f"Rewards: Mean = {np.mean(rewards):.4f}, Median = {np.median(rewards):.4f}, "
       f"Std = {np.std(rewards):.4f}, Min = {np.min(rewards):.4f}, Max = {np.max(rewards):.4f}")
 
 
-# PHASE 3: VISUALIZATION IN HUMAN MODE
+# Visualizing top 5 results graphically
 print("\n" + "=" * 60)
-print("PHASE 3: RENDERING LAYOUTS IN HUMAN MODE")
+print("Visualizing top 5 results graphically")
 print("=" * 60)
 
 
-def render_layout_human(scenario_name, layout, final_cost, total_reward, env):
-    """
-    Render a single layout using human mode visualization.
-    """
-    print(f"\n[RENDER] Displaying layout for '{scenario_name}' scenario...")
-    print(f"[RENDER] Final Cost: {final_cost:.2f}, Total Reward: {total_reward:.4f}")
+def render_layout_human(scenario_name, layout, final_cost, total_reward, env, rank=None):
+    print(f"\n[21] Displaying layout for '{scenario_name}' scenario (Rank #{rank})...")
+    print(f"[21] Final Cost: {final_cost / 1_000_000:.4f}M | Total Reward: {total_reward:.4f}")
     sys.stdout.flush()
 
     # Create figure
@@ -940,7 +947,7 @@ def render_layout_human(scenario_name, layout, final_cost, total_reward, env):
         ax.add_patch(rect)
 
     # Draw facilities with orientation
-    colors = plt.cm.tab10(np.linspace(0, 1, env.n_facilities))# type: ignore
+    colors = plt.cm.tab10(np.linspace(0, 1, env.n_facilities))  # type: ignore
     for fid, (x, y, stored_w, stored_h, orientation) in layout.items():
         if orientation == 1:
             display_w, display_h = stored_h, stored_w
@@ -958,14 +965,13 @@ def render_layout_human(scenario_name, layout, final_cost, total_reward, env):
         ax.text(cx, cy, str(fid), ha='center', va='center',
                 fontsize=12, color='black', fontweight='bold')
 
-
     ax.set_xlim(-2, env.total_length + 2)
     ax.set_ylim(-2, env.total_width + 2)
     ax.set_aspect('equal')
     ax.set_xlabel('Length (m)', fontsize=12)
     ax.set_ylabel('Width (m)', fontsize=12)
     ax.set_title(
-        f"Facility Layout - {scenario_name.upper()} Flow Scenario\n"
+        f"Top #{rank} - Facility Layout ({scenario_name.upper()} Flow)\n"
         f"Cost: {final_cost / 1_000_000:.2f}M | Reward: {total_reward:.4f}",
         fontsize=14, fontweight='bold'
     )
@@ -985,17 +991,33 @@ regular_env = ContinuousIrregularFLPEnv(
     render_mode="human",
     fixed_scenario="regular"
 )
+
+# Sort and select top 5 by lowest cost
 top5 = sorted(regular_flow_results, key=lambda x: x['final_cost'])[:5]
-for result in top5:
+
+# Print + visualize
+for rank, result in enumerate(top5, start=1):
+    print("\n" + "-" * 60)
+    print(f"TOP #{rank} LAYOUT")
+    print("-" * 60)
+    print(f"Final Cost: {result['final_cost'] / 1_000_000:.4f}M")
+    print(f"Total Reward: {result['total_reward']:.4f}")
+    print("Machine Coordinates (x, y, w, h, orientation):")
+
+    for fid, (x, y, w, h, orientation) in result['layout'].items():
+        print(f"  S{fid}: x={x:.2f}, y={y:.2f}, w={w:.2f}, h={h:.2f}, orient={orientation}")
+
+    # Visualize
     render_layout_human(
         "regular",
         result['layout'],
         result['final_cost'],
         result['total_reward'],
-        regular_env
+        regular_env,
+        rank=rank
     )
 
-# SUMMARY
-print("\n📊 Summary:")
-print(f"  ✓ Training completed on 'regular' flow scenario")
-print(f"  ✓ Tested on 'regular' flow scenario: {len(regular_flow_results)} episodes")
+# Summary
+print("\nSummary:")
+print(f"Training completed on 'regular' flow scenario")
+print(f"Tested on 'regular' flow scenario: {len(regular_flow_results)} episodes")
