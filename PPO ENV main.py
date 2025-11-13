@@ -18,6 +18,7 @@ import csv
 from datetime import datetime
 from stable_baselines3.common.vec_env import VecNormalize
 import random
+import itertools
 
 # This class uses base callback from SB3 to write the results during each training step
 class CSVLogging(BaseCallback):
@@ -438,8 +439,9 @@ class ContinuousIrregularFLPEnv(gym.Env):
         # self._select_random_flow_scenario()
         if self.fixed_scenario is not None:
             self.current_scenario = self.fixed_scenario
+            self.flow_matrix = self.flow_scenarios[self.current_scenario]["matrix"]
         else:
-            self.current_scenario = random.choice(list(self.flow_scenarios.keys()))
+            self._select_random_flow_scenario()
 
         # set everything to default after a reset
         self.step_count = 0
@@ -740,7 +742,7 @@ def make_env():
         n_facilities=len(station_refs),
         excel_data=shared_data,  # you called this 'shared_data', not 'preprocessed_data'
         render_mode="rgb_array",
-        fixed_scenario="regular"  # fixed for training only
+        fixed_scenario= None
     )
     return PPOCompatibleEnv(base_env)
 
@@ -794,10 +796,10 @@ print("[11] Training results will be logged to: ppo_training_log##.csv")
 sys.stdout.flush()
 
 try:
-    csv_callback = CSVLogging(csv_filename="ppo_training_log42.csv")
+    csv_callback = CSVLogging(csv_filename="ppo_training_log51.csv")
 
     model.learn(
-        total_timesteps=100, # Important for how long you want to train the model for
+        total_timesteps=100000, # Important for how long you want to train the model for
         callback=csv_callback,
         log_interval=10
     )
@@ -844,8 +846,27 @@ except Exception as e:
     sys.stdout.flush()
     raise
 
+def compute_machine_distances(layout):
+    distances = []
+    ids = sorted(layout.keys())
+
+    # Precompute centers
+    centers = {}
+    for fid, (x, y, l, w, o) in layout.items():
+        dl, dw = (w, l) if o == 1 else (l, w)
+        cx, cy = x + dl / 2.0, y + dw / 2.0
+        centers[fid] = (cx, cy)
+
+    # Compute pairwise Manhattan distances
+    for i, j in itertools.combinations(ids, 2):
+        (x1, y1), (x2, y2) = centers[i], centers[j]
+        dist = abs(x1 - x2) + abs(y1 - y2)
+        distances.append((i, j, dist))
+
+    return distances
+
 # test the model based on the scenario: num_episodes important as to how many times the model is tested
-def test_on_scenario(scenario_name, num_episodes=10, max_steps=200):
+def test_on_scenario(scenario_name, num_episodes=200, max_steps=200):
     print(f"\n[18] Testing on '{scenario_name}' flow scenario ({num_episodes} episodes)...")
     sys.stdout.flush()
 
@@ -895,8 +916,9 @@ def test_on_scenario(scenario_name, num_episodes=10, max_steps=200):
     return results
 
 
-# Test on regular flow scenario
-regular_flow_results = test_on_scenario("regular", num_episodes=10, max_steps=200)
+# Test on all scenarios
+regular_flow_results = test_on_scenario("regular", num_episodes=200, max_steps=200)
+
 
 # Statistical summary
 costs = [r['final_cost'] for r in regular_flow_results]
@@ -982,7 +1004,8 @@ def render_layout_human(scenario_name, layout, final_cost, total_reward, env, ra
 
 
 # Render regular flow results
-print("\n[RENDER] REGULAR FLOW SCENARIO RESULTS:")
+
+print("\n[22] REGULAR FLOW SCENARIO RESULTS:")
 stations_df = shared_data["Stations"]
 station_refs = [s for s in stations_df["Number"] if str(s).startswith("S")]
 regular_env = ContinuousIrregularFLPEnv(
@@ -1017,7 +1040,30 @@ for rank, result in enumerate(top5, start=1):
         rank=rank
     )
 
+print("\n" + "=" * 60)
+print("[23] Pairwise Manhattan distances for best layout")
+print("=" * 60)
+
+# Get the best layout (lowest total cost) from your test results
+regular_flow_results.sort(key=lambda x: x['final_cost'])
+best_layout = regular_flow_results[0]['layout']
+best_cost = regular_flow_results[0]['final_cost']
+
+# Use the Manhattan distance function
+pairwise_distances = compute_machine_distances(best_layout)
+
+# Print all distances
+for i, j, dist in pairwise_distances:
+    print(f"Distance between Machine {i} and Machine {j}: {dist:.2f}")
+
+print("=" * 60)
+total_distance = sum(dist for _, _, dist in pairwise_distances)
+print(f"Total machine distances: {total_distance:.2f}")
+print(f"Best layout total cost: {best_cost:.2f}")
+print("=" * 60)
+
 # Summary
 print("\nSummary:")
-print(f"Training completed on 'regular' flow scenario")
+print(f"Training completed on stochastic flow scenario")
 print(f"Tested on 'regular' flow scenario: {len(regular_flow_results)} episodes")
+
