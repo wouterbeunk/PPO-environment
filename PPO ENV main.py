@@ -1,5 +1,3 @@
-# TRAINING SCRIPT WITH CSV LOGGING
-
 import os
 os.environ["DISABLE_TENSORBOARD"] = "1"
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -94,8 +92,8 @@ class ContinuousIrregularFLPEnv(gym.Env):
     def __init__(self,
                  n_facilities,
                  max_steps: int = 200,
-                 render_mode: str = "human",
-                 seed: int = 42,
+                 render_mode = None,
+                 seed: int = None,
                  excel_data=None,
                  fixed_scenario=None):
 
@@ -251,7 +249,12 @@ class ContinuousIrregularFLPEnv(gym.Env):
         self.step_count = 0
         self.previous_cost = float('inf')
         # random number generation based on the seed
-        self.rng = np.random.default_rng(seed)
+        if seed is None:
+            self.rng = np.random.default_rng()
+        else:
+            self.rng = np.random.default_rng(seed)
+
+        self.debug_mode = False
 
     # function selects the flow scenario based on the weights of the flow matrices
     def _select_random_flow_scenario(self):
@@ -283,34 +286,48 @@ class ContinuousIrregularFLPEnv(gym.Env):
     # creating a function for restricted zones
     # x+l is cannot overlap with the x of restricted zone for example
     def _is_in_restricted_zone(self, x, y, l, w):
-        for (rx, ry, rl, rw) in self.restricted_zones:
-            if not (x + l <= rx or rx + rl <= x or y + w <= ry or ry + rw <= y):
+        for idx, (rx, ry, rl, rw) in enumerate(self.restricted_zones):
+            overlap = not (x + l <= rx or rx + rl <= x or y + w <= ry or ry + rw <= y)
+            if overlap:
+                if self.debug_mode:
+                    print(f"[DEBUG] Facility overlaps restricted zone {idx}: "
+                          f"Facility=({x:.2f},{y:.2f},{l:.2f},{w:.2f}), "
+                          f"Restricted=({rx:.2f},{ry:.2f},{rl:.2f},{rw:.2f})")
                 return True
         return False
 
     # combining previous function and determining whether the placement is valid or not
     def _is_valid_placement(self, x, y, length, width, facility_id, layout=None):
         if not self._is_in_irregular_area(x, y, length, width):
+            if self.debug_mode:
+                print(f"[DEBUG] Facility {facility_id} placed outside allowed area.")
             return False
+
         if self._is_in_restricted_zone(x, y, length, width):
+            if self.debug_mode:
+                print(f"[DEBUG] Facility {facility_id} placed inside restricted zone.")
             return False
 
         if layout is None:
             layout = self.current_layout
 
-        for other_id, (ox, oy, ol, ow, o_orientation) in layout.items():
+        for other_id, (ox, oy, orig_ol, orig_ow, o_orientation) in layout.items():
             if other_id == facility_id:
                 continue
 
-            # Determine display dimensions of other workstation
+            # compute actual dims of the other facility
             if o_orientation == 1:
-                other_display_length, other_display_width = ow, ol
+                other_l, other_w = orig_ow, orig_ol
             else:
-                other_display_length, other_display_width = ol, ow
+                other_l, other_w = orig_ol, orig_ow
 
-            # Check overlap with other workstation
-            if not (x + length <= ox or ox + other_display_length <= x or
-                    y + width <= oy or oy + other_display_width <= y):
+            overlap = not (x + length <= ox or ox + other_l <= x or
+                           y + width <= oy or oy + other_w <= y)
+            if overlap:
+                if self.debug_mode:
+                    print(f"[DEBUG] Facility {facility_id} overlaps machine {other_id}.")
+                    print(f"        F: ({x:.2f},{y:.2f},{length:.2f},{width:.2f}) "
+                          f"O: ({ox:.2f},{oy:.2f},{other_l:.2f},{other_w:.2f})")
                 return False
 
         return True
@@ -350,12 +367,20 @@ class ContinuousIrregularFLPEnv(gym.Env):
 
         # Place first machine freely
         l, w = self.machine_dimensions[prev_fid]
-        orientation = self.rng.integers(0, 2)
-        layout[prev_fid] = (
-            self.rng.uniform(0, self.total_length - l),
-            self.rng.uniform(0, self.total_width - w),
-            l, w, orientation
-        )
+        # Place first machine freely, but check for validity
+        placed = False
+        attempts = 0
+        while not placed and attempts < 1000:
+            orientation = self.rng.integers(0, 2)
+            nx = self.rng.uniform(0, self.total_length - l)
+            ny = self.rng.uniform(0, self.total_width - w)
+            if self._is_valid_placement(nx, ny, l, w, prev_fid, layout):
+                layout[prev_fid] = (nx, ny, l, w, orientation)
+                placed = True
+            attempts += 1
+
+        if not placed:
+            raise RuntimeError(f"Failed to place connected machine {prev_fid} after multiple attempts.")
 
         # Place remaining connected machines
         for idx in range(1, len(self.connected_line)):
@@ -389,7 +414,7 @@ class ContinuousIrregularFLPEnv(gym.Env):
 
                     # Validate
                     if self._is_valid_placement(nx, ny, disp_l, disp_w, fid, layout):
-                        layout[fid] = (nx, ny, l, w, orientation)
+                        layout[fid] = (nx, ny, self.machine_dimensions[fid][0], self.machine_dimensions[fid][1], orientation)
                         placed = True
                         break
                 if placed:
@@ -477,29 +502,64 @@ class ContinuousIrregularFLPEnv(gym.Env):
 
         # Create temporary layout
         temp_layout = self.current_layout.copy()
-        temp_layout[facility_id] = (new_x, new_y, orig_length, orig_width, orientation)
+        # recompute display dims after rotation
+        if orientation == 1:
+            disp_l, disp_w = orig_width, orig_length
+        else:
+            disp_l, disp_w = orig_length, orig_width
 
-        # Validate placement using the current dimensions (w, h)
-        if self._is_valid_placement(new_x, new_y, l, w, facility_id, temp_layout):
+        # validate using correct rotated dims
+        if self._is_valid_placement(new_x, new_y, disp_l, disp_w, facility_id, temp_layout):
             self.current_layout[facility_id] = (new_x, new_y, orig_length, orig_width, orientation)
 
         # If placement is invalid, keep the old position but still apply rotation if it was just a rotation
         elif rotate == 1:
-            # Allow rotation in place even if movement was invalid
-            self.current_layout[facility_id] = (x, y, orig_length, orig_width, orientation)
+            # proposed rotated dimensions
+            if orientation == 1:
+                new_l, new_w = orig_width, orig_length
+            else:
+                new_l, new_w = orig_length, orig_width
+
+            temp_layout = self.current_layout.copy()
+            temp_layout[facility_id] = (x, y, orig_length, orig_width, orientation)
+
+            # only apply rotation if valid
+            if self._is_valid_placement(x, y, new_l, new_w, facility_id, temp_layout):
+                self.current_layout[facility_id] = (x, y, orig_length, orig_width, orientation)
+            # else: ignore the rotation (no-op)
 
         # check whether the box and bucket line are closely placed
         if facility_id in self.connected_line:
             idx = self.connected_line.index(facility_id)
-            # Move all subsequent machines relative to this one
-            dx, dy = np.clip(action['move'], -1.0, 1.0)
+
+            # Compute proposed new positions
+            proposed = {}
             for i in range(idx, len(self.connected_line)):
                 fid = self.connected_line[i]
-                x, y, l, w, o = self.current_layout[fid]
+                x, y, orig_l, orig_w, o = self.current_layout[fid]
+
+                # display dims
+                l, w = (orig_w, orig_l) if o == 1 else (orig_l, orig_w)
+
                 nx = np.clip(x + dx, 0, self.total_length - l)
                 ny = np.clip(y + dy, 0, self.total_width - w)
-                # Keep orientation unchanged
-                self.current_layout[fid] = (nx, ny, l, w, o)
+
+                proposed[fid] = (nx, ny, orig_l, orig_w, o)
+
+            # Validate entire proposed batch
+            temp = self.current_layout.copy()
+            for fid, entry in proposed.items():
+                nx, ny, orig_l, orig_w, o = entry
+                l, w = (orig_w, orig_l) if o == 1 else (orig_l, orig_w)
+
+                if not self._is_valid_placement(nx, ny, l, w, fid, temp):
+                    # reject the whole conveyor shift
+                    break
+
+                temp[fid] = entry
+            else:
+                # apply only if all valid
+                self.current_layout = temp
 
         # Reward calculation
         cost = self._calculate_material_handling_cost()
@@ -507,10 +567,10 @@ class ContinuousIrregularFLPEnv(gym.Env):
         cost_reward = np.clip(cost_reward * 5.0, -1.0, 1.0)  # scale improvements for PPO
 
         avg_dist_to_restricted = self._calculate_proximity_to_restricted_areas()
-        proximity_reward = 1 / (1 + avg_dist_to_restricted)
-        proximity_reward = (proximity_reward - 0.5) * 2  # normalize roughly to [−1, 1]
-        proximity_weight = 0.01
-        total_reward = cost_reward + proximity_weight * (proximity_reward - 0.5)
+        #proximity_reward = 1 / (1 + avg_dist_to_restricted)
+        #proximity_reward = (proximity_reward - 0.5) * 2  # normalize roughly to [−1, 1]
+        #proximity_weight = 1.0
+        total_reward = cost_reward #+ proximity_weight * (proximity_reward - 0.5)
 
         if not self._check_valid_layout():
             total_reward -= 0.5
@@ -578,6 +638,7 @@ class ContinuousIrregularFLPEnv(gym.Env):
 
     # check whether the distance between the parts of the packaging conveyor are max 2m placed apart
     def _check_conveyor_connectivity(self, layout=None):
+        return True
         if layout is None:
             layout = self.current_layout
         max_distance = 2.0  # allowable distance between consecutive machines
@@ -601,13 +662,17 @@ class ContinuousIrregularFLPEnv(gym.Env):
         return True
     # checks the entire layout based on valid placements
     def _check_valid_layout(self):
-        # Validate each placement by passing length,width
-        for fid, (x, y, length, width, orientation) in self.current_layout.items():
-            if not self._is_valid_placement(x, y, length, width, fid, self.current_layout):
+        # Only check restricted zones and placement validity
+        for fid, (x, y, orig_l, orig_w, orientation) in self.current_layout.items():
+            if orientation == 1:
+                l, w = orig_w, orig_l
+            else:
+                l, w = orig_l, orig_w
+
+            if not self._is_valid_placement(x, y, l, w, fid, self.current_layout):
                 return False
-        # Check conveyor connectivity
-        if not self._check_conveyor_connectivity(self.current_layout):
-            return False
+
+        # Skip conveyor connectivity check
         return True
 
     def _get_observation(self):
@@ -741,8 +806,9 @@ def make_env():
     base_env = ContinuousIrregularFLPEnv(
         n_facilities=len(station_refs),
         excel_data=shared_data,  # you called this 'shared_data', not 'preprocessed_data'
-        render_mode="rgb_array",
-        fixed_scenario= None
+        render_mode=None,
+        fixed_scenario= None,
+        seed=None
     )
     return PPOCompatibleEnv(base_env)
 
@@ -756,7 +822,7 @@ print("[6] Creating 2 vectorized dummy environments.")
 sys.stdout.flush()
 
 try:
-    vec_env = DummyVecEnv([make_env for _ in range(2)])
+    vec_env = DummyVecEnv([make_env for _ in range(4)])
     vec_env = VecNormalize(vec_env, norm_obs=False, norm_reward=True, clip_reward=1.0) # type: ignore
     print("[7] Dummy Environments created")
     sys.stdout.flush()
@@ -774,13 +840,14 @@ try:
     model = PPO(
         "MlpPolicy",
         vec_env,
-        verbose=1,
-        batch_size=512,
-        n_steps=4096,
+        verbose=0,
+        device = "cuda",
+        batch_size=1024,
+        n_steps=8192,
         learning_rate=3e-4,
-        n_epochs=3,
+        n_epochs=5,
         gamma=0.99,
-        clip_range=0.3,
+        clip_range=0.2,
         ent_coef=0.005
     )
     print("[9] PPO model successfully created")
@@ -796,10 +863,10 @@ print("[11] Training results will be logged to: ppo_training_log##.csv")
 sys.stdout.flush()
 
 try:
-    csv_callback = CSVLogging(csv_filename="ppo_training_log51.csv")
+    csv_callback = CSVLogging(csv_filename="ppo_training_log58.csv")
 
     model.learn(
-        total_timesteps=100000, # Important for how long you want to train the model for
+        total_timesteps=50000, # Important for how long you want to train the model for
         callback=csv_callback,
         log_interval=10
     )
@@ -866,7 +933,7 @@ def compute_machine_distances(layout):
     return distances
 
 # test the model based on the scenario: num_episodes important as to how many times the model is tested
-def test_on_scenario(scenario_name, num_episodes=200, max_steps=200):
+def test_on_scenario(scenario_name, num_episodes=150, max_steps=200):
     print(f"\n[18] Testing on '{scenario_name}' flow scenario ({num_episodes} episodes)...")
     sys.stdout.flush()
 
@@ -891,7 +958,7 @@ def test_on_scenario(scenario_name, num_episodes=200, max_steps=200):
         done = False
 
         while not done:
-            action, _ = model.predict(obs, deterministic=True)
+            action, _ = model.predict(obs, deterministic=False)
             obs, reward, terminated, truncated, info = test_env.step(action)
             episode_reward += reward
             episode_cost = info.get('cost', 0)
@@ -917,7 +984,7 @@ def test_on_scenario(scenario_name, num_episodes=200, max_steps=200):
 
 
 # Test on all scenarios
-regular_flow_results = test_on_scenario("regular", num_episodes=200, max_steps=200)
+regular_flow_results = test_on_scenario("regular", num_episodes=150, max_steps=200)
 
 
 # Statistical summary
@@ -1066,4 +1133,3 @@ print("=" * 60)
 print("\nSummary:")
 print(f"Training completed on stochastic flow scenario")
 print(f"Tested on 'regular' flow scenario: {len(regular_flow_results)} episodes")
-
