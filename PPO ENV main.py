@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 from PPO_data_loader import data_loader
 from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.vec_env import SubprocVecEnv
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
 import sys
@@ -777,359 +778,363 @@ class PPOCompatibleEnv(gym.Env):
     def render(self):
         return self.env.render()
 
+if __name__ == "__main__":
 
-print("[1] Loading Excel data...")
-sys.stdout.flush()
-
-# Call filepath again
-filepath = "C:\\Users\\beunk\\Downloads\\Bij-producten meta data.xlsx"
-
-try:
-    shared_data = data_loader(filepath).excel_file_loading()
-    print(f"[2] Excel data successfully loaded.")
-    print(f"[3] Loaded Excel sheets: {list(shared_data.keys())}")
+    print("[1] Loading Excel data...")
     sys.stdout.flush()
-except Exception as e:
-    print(f"[ERROR] Failed to load Excel: {e}")
+
+    # Call filepath again
+    filepath = "C:\\Users\\beunk\\Downloads\\Bij-producten meta data.xlsx"
+
+    try:
+        shared_data = data_loader(filepath).excel_file_loading()
+        print(f"[2] Excel data successfully loaded.")
+        print(f"[3] Loaded Excel sheets: {list(shared_data.keys())}")
+        sys.stdout.flush()
+    except Exception as e:
+        print(f"[ERROR] Failed to load Excel: {e}")
+        sys.stdout.flush()
+        raise
+
+    # Loading environment
+    print("[4] Loading predefined environment.")
     sys.stdout.flush()
-    raise
-
-# Loading environment
-print("[4] Loading predefined environment.")
-sys.stdout.flush()
 
 
-def make_env():
+    def make_env():
+        stations_df = shared_data["Stations"]
+        station_refs = [s for s in stations_df["Number"] if str(s).startswith("S")]
+
+        base_env = ContinuousIrregularFLPEnv(
+            n_facilities=len(station_refs),
+            excel_data=shared_data,  # you called this 'shared_data', not 'preprocessed_data'
+            render_mode=None,
+            fixed_scenario= None,
+            seed=None
+        )
+        return PPOCompatibleEnv(base_env)
+
+
+    print("[5] Predefined environment loaded.")
+    sys.stdout.flush()
+
+
+    # Create dummy environments
+    print("[6] Creating 4 parallel environments.")
+    sys.stdout.flush()
+
+    try:
+        # Preferred parallelization
+        vec_env = SubprocVecEnv([make_env for _ in range(4)])
+        vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, clip_reward=10.0)
+        print("[7] SubprocVecEnv successfully created")
+    except Exception as e:
+        print("[7] SubprocVecEnv failed on Windows, switching to DummyVecEnv")
+        sys.stdout.flush()
+
+        # Fallback: DummyVecEnv always works
+        vec_env = DummyVecEnv([make_env for _ in range(4)])
+        vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, clip_reward=10.0)
+
+
+    # Call the PPO model with affiliated hyperparameters
+    print("[8] Creating PPO model.")
+    sys.stdout.flush()
+
+    try:
+        model = PPO(
+            "MlpPolicy",
+            vec_env,
+            verbose=0,
+            device = "cuda",
+            batch_size=1024,
+            n_steps=8192,
+            learning_rate=3e-4,
+            n_epochs=5,
+            gamma=0.99,
+            clip_range=0.2,
+            ent_coef=0.005
+        )
+        print("[9] PPO model successfully created")
+        sys.stdout.flush()
+    except Exception as e:
+        print(f"[ERROR] Failed to create PPO model: {e}")
+        sys.stdout.flush()
+        raise
+
+    # Training of the model
+    print("[10] Starting training")
+    print("[11] Training results will be logged to: ppo_training_log##.csv")
+    sys.stdout.flush()
+
+    try:
+        csv_callback = CSVLogging(csv_filename="ppo_training_log63.csv")
+
+        model.learn(
+            total_timesteps=100000, # Important for how long you want to train the model for
+            callback=csv_callback,
+            log_interval=10
+        )
+        print("[12] Model was trained succesful")
+        sys.stdout.flush()
+    except Exception as e:
+        print(f"[ERROR] Training failed: {e}")
+        sys.stdout.flush()
+        raise
+
+    # Saving of the model on the internal drive
+    print("[13] Saving trained model on internal drive")
+    sys.stdout.flush()
+
+    try:
+        model.save("ppo_flp_agent")
+        print("[14] Model saved as 'ppo_flp_agent'")
+        sys.stdout.flush()
+    except Exception as e:
+        print(f"[ERROR] Failed to save model: {e}")
+        sys.stdout.flush()
+        raise
+
+    print("\n" + "=" * 60)
+    print("Training is completed")
+    print("=" * 60)
+    print("\n📊 Results saved to:")
+    print("  ✓ ppo_training_log##.csv")
+    print("=" * 60)
+
+    # testing the trained model
+    print("\n" + "=" * 60)
+    print("[15] Initiating the testing phase of the trained model.")
+    print("=" * 60)
+
+    # Load the trained model
+    print("[16] Loading trained model")
+    try:
+        model = PPO.load("ppo_flp_agent")
+        print("[17] Model loaded successfully.")
+        sys.stdout.flush()
+    except Exception as e:
+        print(f"[ERROR] Failed to load model: {e}")
+        sys.stdout.flush()
+        raise
+
+    def compute_machine_distances(layout):
+        distances = []
+        ids = sorted(layout.keys())
+
+        # Precompute centers
+        centers = {}
+        for fid, (x, y, l, w, o) in layout.items():
+            dl, dw = (w, l) if o == 1 else (l, w)
+            cx, cy = x + dl / 2.0, y + dw / 2.0
+            centers[fid] = (cx, cy)
+
+        # Compute pairwise Manhattan distances
+        for i, j in itertools.combinations(ids, 2):
+            (x1, y1), (x2, y2) = centers[i], centers[j]
+            dist = abs(x1 - x2) + abs(y1 - y2)
+            distances.append((i, j, dist))
+
+        return distances
+
+    # test the model based on the scenario: num_episodes important as to how many times the model is tested
+    def test_on_scenario(scenario_name, num_episodes=200, max_steps=200):
+        print(f"\n[18] Testing on '{scenario_name}' flow scenario ({num_episodes} episodes)...")
+        sys.stdout.flush()
+
+        stations_df = shared_data["Stations"]
+        station_refs = [s for s in stations_df["Number"] if str(s).startswith("S")]
+
+        test_env = ContinuousIrregularFLPEnv(
+            n_facilities=len(station_refs),
+            excel_data=shared_data,
+            render_mode="rgb_array",
+            fixed_scenario=scenario_name,
+            max_steps=max_steps
+        )
+        test_env = PPOCompatibleEnv(test_env)
+
+        results = []
+
+        for episode in range(num_episodes):
+            obs, info = test_env.reset()
+            episode_reward = 0
+            episode_cost = 0
+            done = False
+
+            while not done:
+                action, _ = model.predict(obs, deterministic=False)
+                obs, reward, terminated, truncated, info = test_env.step(action)
+                episode_reward += reward
+                episode_cost = info.get('cost', 0)
+                done = terminated or truncated
+
+            final_layout = test_env.env.current_layout.copy()
+            results.append({
+                'episode': episode + 1,
+                'layout': final_layout,
+                'final_cost': episode_cost,
+                'total_reward': episode_reward
+            })
+
+            if (episode + 1) % 20 == 0:
+                print(f"[19] Episode {episode + 1}/{num_episodes} completed.")
+                sys.stdout.flush()
+
+        test_env.close()
+
+        # Sort results by final cost (ascending)
+        results.sort(key=lambda x: x['final_cost'])
+        return results
+
+
+    # Test on all scenarios
+    regular_flow_results = test_on_scenario("regular", num_episodes=200, max_steps=200)
+
+
+    # Statistical summary
+    costs = [r['final_cost'] for r in regular_flow_results]
+    rewards = [r['total_reward'] for r in regular_flow_results]
+
+    print("\n [20]Statistical Summary:")
+    print(f"Costs (in millions): Mean = {np.mean(costs)/1_000_000:.2f}, Median = {np.median(costs)/1_000_000:.2f}, "
+          f"Std = {np.std(costs)/1_000_000:.2f}, Min = {np.min(costs)/1_000_000:.2f}, Max = {np.max(costs)/1_000_000:.2f}")
+    print(f"Rewards: Mean = {np.mean(rewards):.4f}, Median = {np.median(rewards):.4f}, "
+          f"Std = {np.std(rewards):.4f}, Min = {np.min(rewards):.4f}, Max = {np.max(rewards):.4f}")
+
+
+    # Visualizing top 5 results graphically
+    print("\n" + "=" * 60)
+    print("Visualizing top 5 results graphically")
+    print("=" * 60)
+
+
+    def render_layout_human(scenario_name, layout, final_cost, total_reward, env, rank=None):
+        print(f"\n[21] Displaying layout for '{scenario_name}' scenario (Rank #{rank})...")
+        print(f"[21] Final Cost: {final_cost / 1_000_000:.4f}M | Total Reward: {total_reward:.4f}")
+        sys.stdout.flush()
+
+        # Create figure
+        fig, ax = plt.subplots(figsize=(12, 10))
+
+        # Draw irregular area outline
+        irregular_outline = np.array([
+            [0, 0],
+            [29.1, 0],
+            [29.1, 18.5],
+            [37, 18.5],
+            [37, 22.7],
+            [29.1, 22.7],
+            [29.1, 28.82],
+            [29.1, 39.98],
+            [12.04, 39.98],
+            [12.04, 29.1],
+            [0, 29.1],
+            [0, 0]
+        ])
+        ax.plot(irregular_outline[:, 0], irregular_outline[:, 1], 'k-', lw=2)
+        ax.fill(irregular_outline[:, 0], irregular_outline[:, 1], color='lightgray', alpha=0.3)
+
+        # Draw restricted zones
+        for (rx, ry, rw, rh) in env.restricted_zones:
+            rect = Rectangle((rx, ry), rw, rh, color='red', alpha=0.5)
+            ax.add_patch(rect)
+
+        # Draw facilities with orientation
+        colors = plt.cm.tab10(np.linspace(0, 1, env.n_facilities))  # type: ignore
+        for fid, (x, y, stored_w, stored_h, orientation) in layout.items():
+            if orientation == 1:
+                display_w, display_h = stored_h, stored_w
+            else:
+                display_w, display_h = stored_w, stored_h
+
+            rect = Rectangle((x, y), display_w, display_h,
+                             linewidth=2,
+                             edgecolor='black',
+                             facecolor=colors[fid % 10],
+                             alpha=0.8)
+            ax.add_patch(rect)
+
+            cx, cy = x + display_w / 2, y + display_h / 2
+            ax.text(cx, cy, str(fid), ha='center', va='center',
+                    fontsize=12, color='black', fontweight='bold')
+
+        ax.set_xlim(-2, env.total_length + 2)
+        ax.set_ylim(-2, env.total_width + 2)
+        ax.set_aspect('equal')
+        ax.set_xlabel('Length (m)', fontsize=12)
+        ax.set_ylabel('Width (m)', fontsize=12)
+        ax.set_title(
+            f"Top #{rank} - Facility Layout ({scenario_name.upper()} Flow)\n"
+            f"Cost: {final_cost / 1_000_000:.2f}M | Reward: {total_reward:.4f}",
+            fontsize=14, fontweight='bold'
+        )
+        ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.show()
+
+
+    # Render regular flow results
+
+    print("\n[22] REGULAR FLOW SCENARIO RESULTS:")
     stations_df = shared_data["Stations"]
     station_refs = [s for s in stations_df["Number"] if str(s).startswith("S")]
-
-    base_env = ContinuousIrregularFLPEnv(
-        n_facilities=len(station_refs),
-        excel_data=shared_data,  # you called this 'shared_data', not 'preprocessed_data'
-        render_mode=None,
-        fixed_scenario= None,
-        seed=None
-    )
-    return PPOCompatibleEnv(base_env)
-
-
-print("[5] Predefined environment loaded.")
-sys.stdout.flush()
-
-
-# Create dummy environments
-print("[6] Creating 2 vectorized dummy environments.")
-sys.stdout.flush()
-
-try:
-    vec_env = DummyVecEnv([make_env for _ in range(4)])
-    vec_env = VecNormalize(vec_env, norm_obs=False, norm_reward=True, clip_reward=1.0) # type: ignore
-    print("[7] Dummy Environments created")
-    sys.stdout.flush()
-except Exception as e:
-    print(f"[ERROR] Failed to create vectorized environment: {e}")
-    sys.stdout.flush()
-    raise
-
-
-# Call the PPO model with affiliated hyperparameters
-print("[8] Creating PPO model.")
-sys.stdout.flush()
-
-try:
-    model = PPO(
-        "MlpPolicy",
-        vec_env,
-        verbose=0,
-        device = "cuda",
-        batch_size=1024,
-        n_steps=8192,
-        learning_rate=3e-4,
-        n_epochs=5,
-        gamma=0.99,
-        clip_range=0.2,
-        ent_coef=0.005
-    )
-    print("[9] PPO model successfully created")
-    sys.stdout.flush()
-except Exception as e:
-    print(f"[ERROR] Failed to create PPO model: {e}")
-    sys.stdout.flush()
-    raise
-
-# Training of the model
-print("[10] Starting training")
-print("[11] Training results will be logged to: ppo_training_log##.csv")
-sys.stdout.flush()
-
-try:
-    csv_callback = CSVLogging(csv_filename="ppo_training_log58.csv")
-
-    model.learn(
-        total_timesteps=50000, # Important for how long you want to train the model for
-        callback=csv_callback,
-        log_interval=10
-    )
-    print("[12] Model was trained succesful")
-    sys.stdout.flush()
-except Exception as e:
-    print(f"[ERROR] Training failed: {e}")
-    sys.stdout.flush()
-    raise
-
-# Saving of the model on the internal drive
-print("[13] Saving trained model on internal drive")
-sys.stdout.flush()
-
-try:
-    model.save("ppo_flp_agent")
-    print("[14] Model saved as 'ppo_flp_agent'")
-    sys.stdout.flush()
-except Exception as e:
-    print(f"[ERROR] Failed to save model: {e}")
-    sys.stdout.flush()
-    raise
-
-print("\n" + "=" * 60)
-print("Training is completed")
-print("=" * 60)
-print("\n📊 Results saved to:")
-print("  ✓ ppo_training_log##.csv")
-print("=" * 60)
-
-# testing the trained model
-print("\n" + "=" * 60)
-print("[15] Initiating the testing phase of the trained model.")
-print("=" * 60)
-
-# Load the trained model
-print("[16] Loading trained model")
-try:
-    model = PPO.load("ppo_flp_agent")
-    print("[17] Model loaded successfully.")
-    sys.stdout.flush()
-except Exception as e:
-    print(f"[ERROR] Failed to load model: {e}")
-    sys.stdout.flush()
-    raise
-
-def compute_machine_distances(layout):
-    distances = []
-    ids = sorted(layout.keys())
-
-    # Precompute centers
-    centers = {}
-    for fid, (x, y, l, w, o) in layout.items():
-        dl, dw = (w, l) if o == 1 else (l, w)
-        cx, cy = x + dl / 2.0, y + dw / 2.0
-        centers[fid] = (cx, cy)
-
-    # Compute pairwise Manhattan distances
-    for i, j in itertools.combinations(ids, 2):
-        (x1, y1), (x2, y2) = centers[i], centers[j]
-        dist = abs(x1 - x2) + abs(y1 - y2)
-        distances.append((i, j, dist))
-
-    return distances
-
-# test the model based on the scenario: num_episodes important as to how many times the model is tested
-def test_on_scenario(scenario_name, num_episodes=150, max_steps=200):
-    print(f"\n[18] Testing on '{scenario_name}' flow scenario ({num_episodes} episodes)...")
-    sys.stdout.flush()
-
-    stations_df = shared_data["Stations"]
-    station_refs = [s for s in stations_df["Number"] if str(s).startswith("S")]
-
-    test_env = ContinuousIrregularFLPEnv(
+    regular_env = ContinuousIrregularFLPEnv(
         n_facilities=len(station_refs),
         excel_data=shared_data,
-        render_mode="rgb_array",
-        fixed_scenario=scenario_name,
-        max_steps=max_steps
-    )
-    test_env = PPOCompatibleEnv(test_env)
-
-    results = []
-
-    for episode in range(num_episodes):
-        obs, info = test_env.reset()
-        episode_reward = 0
-        episode_cost = 0
-        done = False
-
-        while not done:
-            action, _ = model.predict(obs, deterministic=False)
-            obs, reward, terminated, truncated, info = test_env.step(action)
-            episode_reward += reward
-            episode_cost = info.get('cost', 0)
-            done = terminated or truncated
-
-        final_layout = test_env.env.current_layout.copy()
-        results.append({
-            'episode': episode + 1,
-            'layout': final_layout,
-            'final_cost': episode_cost,
-            'total_reward': episode_reward
-        })
-
-        if (episode + 1) % 20 == 0:
-            print(f"[19] Episode {episode + 1}/{num_episodes} completed.")
-            sys.stdout.flush()
-
-    test_env.close()
-
-    # Sort results by final cost (ascending)
-    results.sort(key=lambda x: x['final_cost'])
-    return results
-
-
-# Test on all scenarios
-regular_flow_results = test_on_scenario("regular", num_episodes=150, max_steps=200)
-
-
-# Statistical summary
-costs = [r['final_cost'] for r in regular_flow_results]
-rewards = [r['total_reward'] for r in regular_flow_results]
-
-print("\n [20]Statistical Summary:")
-print(f"Costs (in millions): Mean = {np.mean(costs)/1_000_000:.2f}, Median = {np.median(costs)/1_000_000:.2f}, "
-      f"Std = {np.std(costs)/1_000_000:.2f}, Min = {np.min(costs)/1_000_000:.2f}, Max = {np.max(costs)/1_000_000:.2f}")
-print(f"Rewards: Mean = {np.mean(rewards):.4f}, Median = {np.median(rewards):.4f}, "
-      f"Std = {np.std(rewards):.4f}, Min = {np.min(rewards):.4f}, Max = {np.max(rewards):.4f}")
-
-
-# Visualizing top 5 results graphically
-print("\n" + "=" * 60)
-print("Visualizing top 5 results graphically")
-print("=" * 60)
-
-
-def render_layout_human(scenario_name, layout, final_cost, total_reward, env, rank=None):
-    print(f"\n[21] Displaying layout for '{scenario_name}' scenario (Rank #{rank})...")
-    print(f"[21] Final Cost: {final_cost / 1_000_000:.4f}M | Total Reward: {total_reward:.4f}")
-    sys.stdout.flush()
-
-    # Create figure
-    fig, ax = plt.subplots(figsize=(12, 10))
-
-    # Draw irregular area outline
-    irregular_outline = np.array([
-        [0, 0],
-        [29.1, 0],
-        [29.1, 18.5],
-        [37, 18.5],
-        [37, 22.7],
-        [29.1, 22.7],
-        [29.1, 28.82],
-        [29.1, 39.98],
-        [12.04, 39.98],
-        [12.04, 29.1],
-        [0, 29.1],
-        [0, 0]
-    ])
-    ax.plot(irregular_outline[:, 0], irregular_outline[:, 1], 'k-', lw=2)
-    ax.fill(irregular_outline[:, 0], irregular_outline[:, 1], color='lightgray', alpha=0.3)
-
-    # Draw restricted zones
-    for (rx, ry, rw, rh) in env.restricted_zones:
-        rect = Rectangle((rx, ry), rw, rh, color='red', alpha=0.5)
-        ax.add_patch(rect)
-
-    # Draw facilities with orientation
-    colors = plt.cm.tab10(np.linspace(0, 1, env.n_facilities))  # type: ignore
-    for fid, (x, y, stored_w, stored_h, orientation) in layout.items():
-        if orientation == 1:
-            display_w, display_h = stored_h, stored_w
-        else:
-            display_w, display_h = stored_w, stored_h
-
-        rect = Rectangle((x, y), display_w, display_h,
-                         linewidth=2,
-                         edgecolor='black',
-                         facecolor=colors[fid % 10],
-                         alpha=0.8)
-        ax.add_patch(rect)
-
-        cx, cy = x + display_w / 2, y + display_h / 2
-        ax.text(cx, cy, str(fid), ha='center', va='center',
-                fontsize=12, color='black', fontweight='bold')
-
-    ax.set_xlim(-2, env.total_length + 2)
-    ax.set_ylim(-2, env.total_width + 2)
-    ax.set_aspect('equal')
-    ax.set_xlabel('Length (m)', fontsize=12)
-    ax.set_ylabel('Width (m)', fontsize=12)
-    ax.set_title(
-        f"Top #{rank} - Facility Layout ({scenario_name.upper()} Flow)\n"
-        f"Cost: {final_cost / 1_000_000:.2f}M | Reward: {total_reward:.4f}",
-        fontsize=14, fontweight='bold'
-    )
-    ax.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.show()
-
-
-# Render regular flow results
-
-print("\n[22] REGULAR FLOW SCENARIO RESULTS:")
-stations_df = shared_data["Stations"]
-station_refs = [s for s in stations_df["Number"] if str(s).startswith("S")]
-regular_env = ContinuousIrregularFLPEnv(
-    n_facilities=len(station_refs),
-    excel_data=shared_data,
-    render_mode="human",
-    fixed_scenario="regular"
-)
-
-# Sort and select top 5 by lowest cost
-top5 = sorted(regular_flow_results, key=lambda x: x['final_cost'])[:5]
-
-# Print + visualize
-for rank, result in enumerate(top5, start=1):
-    print("\n" + "-" * 60)
-    print(f"TOP #{rank} LAYOUT")
-    print("-" * 60)
-    print(f"Final Cost: {result['final_cost'] / 1_000_000:.4f}M")
-    print(f"Total Reward: {result['total_reward']:.4f}")
-    print("Machine Coordinates (x, y, w, h, orientation):")
-
-    for fid, (x, y, w, h, orientation) in result['layout'].items():
-        print(f"  S{fid}: x={x:.2f}, y={y:.2f}, w={w:.2f}, h={h:.2f}, orient={orientation}")
-
-    # Visualize
-    render_layout_human(
-        "regular",
-        result['layout'],
-        result['final_cost'],
-        result['total_reward'],
-        regular_env,
-        rank=rank
+        render_mode="human",
+        fixed_scenario="regular"
     )
 
-print("\n" + "=" * 60)
-print("[23] Pairwise Manhattan distances for best layout")
-print("=" * 60)
+    # Sort and select top 5 by lowest cost
+    top5 = sorted(regular_flow_results, key=lambda x: x['final_cost'])[:5]
 
-# Get the best layout (lowest total cost) from your test results
-regular_flow_results.sort(key=lambda x: x['final_cost'])
-best_layout = regular_flow_results[0]['layout']
-best_cost = regular_flow_results[0]['final_cost']
+    # Print + visualize
+    for rank, result in enumerate(top5, start=1):
+        print("\n" + "-" * 60)
+        print(f"TOP #{rank} LAYOUT")
+        print("-" * 60)
+        print(f"Final Cost: {result['final_cost'] / 1_000_000:.4f}M")
+        print(f"Total Reward: {result['total_reward']:.4f}")
+        print("Machine Coordinates (x, y, w, h, orientation):")
 
-# Use the Manhattan distance function
-pairwise_distances = compute_machine_distances(best_layout)
+        for fid, (x, y, w, h, orientation) in result['layout'].items():
+            print(f"  S{fid}: x={x:.2f}, y={y:.2f}, w={w:.2f}, h={h:.2f}, orient={orientation}")
 
-# Print all distances
-for i, j, dist in pairwise_distances:
-    print(f"Distance between Machine {i} and Machine {j}: {dist:.2f}")
+        # Visualize
+        render_layout_human(
+            "regular",
+            result['layout'],
+            result['final_cost'],
+            result['total_reward'],
+            regular_env,
+            rank=rank
+        )
 
-print("=" * 60)
-total_distance = sum(dist for _, _, dist in pairwise_distances)
-print(f"Total machine distances: {total_distance:.2f}")
-print(f"Best layout total cost: {best_cost:.2f}")
-print("=" * 60)
+    print("\n" + "=" * 60)
+    print("[23] Pairwise Manhattan distances for best layout")
+    print("=" * 60)
 
-# Summary
-print("\nSummary:")
-print(f"Training completed on stochastic flow scenario")
-print(f"Tested on 'regular' flow scenario: {len(regular_flow_results)} episodes")
+    # Get the best layout (lowest total cost) from your test results
+    regular_flow_results.sort(key=lambda x: x['final_cost'])
+    best_layout = regular_flow_results[0]['layout']
+    best_cost = regular_flow_results[0]['final_cost']
+
+    # Use the Manhattan distance function
+    pairwise_distances = compute_machine_distances(best_layout)
+
+    # Print all distances
+    for i, j, dist in pairwise_distances:
+        print(f"Distance between Machine {i} and Machine {j}: {dist:.2f}")
+
+    print("=" * 60)
+    total_distance = sum(dist for _, _, dist in pairwise_distances)
+    print(f"Total machine distances: {total_distance:.2f}")
+    print(f"Best layout total cost: {best_cost:.2f}")
+    print("=" * 60)
+
+    # Summary
+    print("\nSummary:")
+    print(f"Training completed on stochastic flow scenario")
+    print(f"Tested on 'regular' flow scenario: {len(regular_flow_results)} episodes")
