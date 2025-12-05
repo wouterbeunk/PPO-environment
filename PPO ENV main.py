@@ -1,4 +1,5 @@
 import os
+os.environ["DISABLE_TENSORBOARD"] = "1"
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 import gymnasium as gym
@@ -10,22 +11,17 @@ from PPO_data_loader import data_loader
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.vec_env import SubprocVecEnv
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
-from stable_baselines3.common.vec_env import VecNormalize
-from torch.utils.tensorboard import SummaryWriter
+from stable_baselines3.common.callbacks import BaseCallback
 import sys
 import csv
 from datetime import datetime
+from stable_baselines3.common.vec_env import VecNormalize
+from torch.utils.tensorboard import SummaryWriter
 import random
 import itertools
 
 # This class uses base callback from SB3 to write the results during each training step
 class EnhancedLogging(BaseCallback):
-    """
-    Callback for logging training progress to both CSV and TensorBoard.
-    Tracks material handling costs, rewards, and learning rates.
-    """
-
     def __init__(self, csv_filename="ppo_training_log.csv",
                  tensorboard_log="./tensorboard_logs/", verbose=0):
         super().__init__(verbose)
@@ -119,6 +115,8 @@ class EnhancedLogging(BaseCallback):
         self.writer.flush()
         self.writer.close()
 
+
+
 #Checks for any immediate errors
 print("[DEBUG] Script starting...")
 sys.stdout.flush()
@@ -134,7 +132,8 @@ class ContinuousIrregularFLPEnv(gym.Env):
                  render_mode = None,
                  seed: int = None,
                  excel_data=None,
-                 fixed_scenario=None):
+                 fixed_scenario=None,
+                 initial_layout=None):
 
         super().__init__()
 
@@ -266,6 +265,8 @@ class ContinuousIrregularFLPEnv(gym.Env):
         self.connected_line = [8, 9, 10, 11]
         self.connected_line_spacing = 0.0
 
+        self.initial_layout = initial_layout
+
         # creating the action space dictionary, because facilityID is discrete and placement should be continuous
         # both x and y coordinates of the facilities can be moved in a continuous action space ranging from -1 until 1
         # agent can choose whether to not rotate = 0 or rotate = 1
@@ -280,10 +281,10 @@ class ContinuousIrregularFLPEnv(gym.Env):
         self.current_facility_idx = 0
 
         # setting the total possible area where the agent can look (so from 0, 0 until the max length and width)
-        # 5 values per facility (x,y,l,w,orientation) + one-hot
         self.observation_space = spaces.Box(
-            low=0.0, high=1.0,
-            shape=(self.n_facilities * 5 + self.n_facilities,),
+            low=0.0,
+            high=1.0,
+            shape=(self.n_facilities * 2 + self.n_facilities,),
             dtype=np.float32
         )
 
@@ -513,7 +514,14 @@ class ContinuousIrregularFLPEnv(gym.Env):
 
         # set everything to default after a reset
         self.current_facility_idx = 0
-        self.current_layout = self._generate_random_layout()
+        if self.initial_layout is not None:
+            self.current_layout = self.initial_layout.copy()
+            self.baseline_cost = self._calculate_material_handling_cost()
+        else:
+            self.current_layout = self._generate_random_layout()
+            self.baseline_cost = float('inf')
+
+        self.initial_baseline_cost = self.baseline_cost  # Immutable reference
 
         self.previous_cost = self._calculate_material_handling_cost()
         obs = self.get_observation()
@@ -524,112 +532,58 @@ class ContinuousIrregularFLPEnv(gym.Env):
     def step(self, action):
         self.step_count += 1
 
-        # Parse action array: [dx, dy, rotate]
-        dx, dy = np.clip(action[0:2], -1.0, 1.0)
+        # Unpack action
+        dx, dy = np.clip(action[0:2], -1, 1)
         rotate = int(np.clip(np.round(action[2]), 0, 1))
 
-        # Use the current facility index for this step
         facility_id = self.current_facility_idx
 
-        # Get original dimensions from machine_dimensions
+        # Current machine state
         orig_length, orig_width = self.machine_dimensions[facility_id]
         x, y, stored_l, stored_w, orientation = self.current_layout[facility_id]
 
-        # Apply rotation if needed
-        if rotate == 1:
-            orientation = 1 - orientation
-
-        # Compute display dimensions based on orientation
-        if orientation == 1:
+        # Apply rotation if chosen
+        new_orientation = 1 - orientation if rotate == 1 else orientation
+        if new_orientation == 1:
             l, w = orig_width, orig_length
         else:
             l, w = orig_length, orig_width
 
-        # Proposed new position
+        # Proposed translation
         STEP_SIZE = 3.0
         new_x = np.clip(x + dx * STEP_SIZE, 0, self.total_length - l)
         new_y = np.clip(y + dy * STEP_SIZE, 0, self.total_width - w)
 
-        # Create temp layout for validation
-        temp_layout = self.current_layout.copy()
+        # Compute cost before move
+        cost_before = self._calculate_material_handling_cost()
 
-        # Validate placement
-        if self._is_valid_placement(new_x, new_y, l, w, facility_id, temp_layout):
-            self.current_layout[facility_id] = (new_x, new_y, orig_length, orig_width, orientation)
-        elif rotate == 1:
-            # Attempt rotation if initial placement invalid
-            new_orientation = 1 - orientation
-            if new_orientation == 1:
-                new_l, new_w = orig_width, orig_length
-            else:
-                new_l, new_w = orig_length, orig_width
-
-            # Validate rotated placement
-            if self._is_valid_placement(x, y, new_l, new_w, facility_id, temp_layout):
-                self.current_layout[facility_id] = (x, y, orig_length, orig_width, new_orientation)
-
-        # If connected line, update subsequent facilities accordingly
-        if facility_id in self.connected_line:
-            idx = self.connected_line.index(facility_id)
-            proposed = {}
-
-            for i in range(idx, len(self.connected_line)):
-                fid = self.connected_line[i]
-                x, y, orig_l, orig_w, o = self.current_layout[fid]
-                l_dim, w_dim = (orig_w, orig_l) if o == 1 else (orig_l, orig_w)
-
-                nx = np.clip(x + dx, 0, self.total_length - l_dim)
-                ny = np.clip(y + dy, 0, self.total_width - w_dim)
-
-                proposed[fid] = (nx, ny, orig_l, orig_w, o)
-
-            # Validate entire proposed batch
-            temp = self.current_layout.copy()
-            for fid, entry in proposed.items():
-                nx, ny, ol, ow, o = entry
-                l_dim, w_dim = (ow, ol) if o == 1 else (ol, ow)
-                if not self._is_valid_placement(nx, ny, l_dim, w_dim, fid, temp):
-                    break
-                temp[fid] = (nx, ny, ol, ow, o)
-            else:
-                self.current_layout = temp
-
-        # Move to next facility
-        self.current_facility_idx = (self.current_facility_idx + 1) % self.n_facilities
-
-        # ------------------------------------------------------------------
-        #               ✔ FIXED COST + REWARD LOGIC (Problem B)
-        # ------------------------------------------------------------------
-
-        cost = self._calculate_material_handling_cost()
-
-        if self.previous_cost is None:
-            # First step of episode: define baseline only
-            reward = 0.0
+        # Try move, revert if invalid
+        if self._is_valid_placement(new_x, new_y, l, w, facility_id, self.current_layout):
+            self.current_layout[facility_id] = (new_x, new_y, orig_length, orig_width, new_orientation)
+            invalid_move = False
         else:
-            # Reward = improvement from previous step
-            cost_diff = self.previous_cost - cost
+            invalid_move = True
 
-            if self.previous_cost > 0:
-                reward = cost_diff / self.previous_cost
-            else:
-                reward = 0.0
+        # Compute new cost
+        cost_after = self._calculate_material_handling_cost()
 
-        # Layout validity reward/penalty
-        if self._check_valid_layout():
-            reward += 0.2
-        else:
+        reward = (cost_before - cost_after) / 1000000
+
+        if cost_after < self.baseline_cost:
+            reward += 0.5  # Significant bonus for finding something better
+
+        # Small penalty for invalid actions
+        if invalid_move:
             reward -= 0.5
 
-        # Now update previous_cost for the next step
-        self.previous_cost = cost
+        # Move to next facility (cyclic)
+        self.current_facility_idx = (self.current_facility_idx + 1) % self.n_facilities
 
-        # ------------------------------------------------------------------
-
+        # Check termination
         terminated = self.step_count >= self.max_steps
         truncated = False
 
-        return self.get_observation(), reward, terminated, truncated, {'cost': cost}
+        return self.get_observation(), reward, terminated, truncated, {"cost": cost_after}
 
     def _calculate_material_handling_cost(self):
         total_cost = 0.0
@@ -666,7 +620,7 @@ class ContinuousIrregularFLPEnv(gym.Env):
                         continue
                     tx, ty = station_positions[target][0:2]
 
-                # S11 → nearest exit
+                # S11 â†’ nearest exit
                 elif str(source) in ["11", "s11"]:
                     # find nearest exit to S11
                     nearest_exit, min_dist = None, float("inf")
@@ -727,29 +681,14 @@ class ContinuousIrregularFLPEnv(gym.Env):
 
     def get_observation(self):
         obs = []
-
         for fid in range(self.n_facilities):
             if fid in self.current_layout:
-                x, y, orig_l, orig_w, orientation = self.current_layout[fid]
-
-                # Orientation-normalized displayed dimensions
-                if orientation == 1:
-                    l, w = orig_w, orig_l
-                else:
-                    l, w = orig_l, orig_w
-
-                # Normalized positions + dims
-                obs.extend([
-                    x / self.total_length,
-                    y / self.total_width,
-                    l / self.total_length,
-                    w / self.total_width,
-                    float(orientation)
-                ])
+                x, y, _, _, _ = self.current_layout[fid]
             else:
-                obs.extend([0, 0, 0, 0, 0])
+                x, y = 0, 0
+            obs.extend([x / self.total_length, y / self.total_width])
 
-        # one-hot current facility
+        # Add one-hot encoding of current facility being modified
         facility_indicator = np.zeros(self.n_facilities, dtype=np.float32)
         facility_indicator[self.current_facility_idx] = 1.0
         obs.extend(facility_indicator)
@@ -871,15 +810,38 @@ if __name__ == "__main__":
 
 
     def make_env():
+        # Re-extract stations data inside make_env for consistency
         stations_df = shared_data["Stations"]
         station_refs = [s for s in stations_df["Number"] if str(s).startswith("S")]
+
+        # Use the provided preset layout
+        preset_layout = {
+            0: (19.5, 10.2, 0.8, 0.8, 0),
+            1: (17.5, 9.7, 1, 1, 0),
+            2: (6.4, 7.8, 1.5, 3, 0),
+            3: (11.6, 6.1, 0.9, 0.6, 0),
+            4: (6.8, 5.0, 1.3, 0.4, 0),
+            5: (10.8, 11.8, 10.6, 1.96, 0),
+            6: (10.8, 7.3, 7.04, 1.98, 0),
+            7: (12.1, 24.4, 2.06, 1.8, 0),
+            8: (23.0, 2.0, 2.7, 12.5, 0),
+            9: (19.4, 2.0, 3.6, 2.0, 0),
+            10: (17.6, 1.85, 1.8, 2.8, 0),
+            11: (5.2, 3.8, 12.3, 1.0, 0),
+            12: (14.2, 17.3, 8.5, 5.5, 0),
+            13: (12.1, 31.0, 7.0, 7.0, 0),
+            14: (25.2, 36.3, 3.8, 3.0, 0),
+            15: (19.6, 29.9, 5.3, 2.5, 0),
+            16: (21.7, 38.6, 3, 1, 0)
+        }
 
         base_env = ContinuousIrregularFLPEnv(
             n_facilities=len(station_refs),
             excel_data=shared_data,
             render_mode=None,
             fixed_scenario=None,
-            seed=None
+            seed=None,
+            initial_layout=preset_layout
         )
         return PPOCompatibleEnv(base_env)
 
@@ -889,13 +851,13 @@ if __name__ == "__main__":
 
 
     # Create dummy environments
-    print("[6] Creating 4 parallel environments.")
+    print("[6] Creating 6 parallel environments.")
     sys.stdout.flush()
 
     try:
         # Preferred parallelization
         vec_env = SubprocVecEnv([make_env for _ in range(6)])
-        vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, clip_reward=10.0)
+        vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=False, clip_reward=10.0)
         print("[7] SubprocVecEnv successfully created")
     except Exception as e:
         print("[7] SubprocVecEnv failed on Windows, switching to DummyVecEnv")
@@ -910,79 +872,50 @@ if __name__ == "__main__":
     print("[8] Creating PPO model with TensorBoard logging...")
     sys.stdout.flush()
 
-    # Create timestamped directory for this training run
+    # Create timestamped directories for TensorBoard logs
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     tensorboard_dir = f"./tensorboard_logs/ppo_training_{timestamp}"
-    models_dir = f"./models/{timestamp}"
 
-    # Create directories if they don't exist
     os.makedirs(tensorboard_dir, exist_ok=True)
-    os.makedirs(models_dir, exist_ok=True)
 
     try:
         model = PPO(
             "MlpPolicy",
             vec_env,
-            verbose=1,  # Set to 1 to see training progress
+            verbose=1,  # Changed from 0 to 1 for more output
             device="cuda",
-            batch_size=2048,
-            n_steps=16384,
-            learning_rate=1e-4,
+            batch_size=512,
+            n_steps=2048,
+            learning_rate=3e-4,
             n_epochs=5,
             gamma=0.99,
-            clip_range=0.1,
-            ent_coef=0.01,
-            tensorboard_log=tensorboard_dir,  # ← ADDED: TensorBoard logging
+            clip_range=0.2,
+            ent_coef=0.2,
+            tensorboard_log=tensorboard_dir,
         )
-        print("[8.1] PPO model successfully created")
-        print(f"[8.2] TensorBoard logs: tensorboard --logdir={tensorboard_dir}")
+        print("[9] PPO model successfully created")
+        print(f"[9.1] TensorBoard logs: tensorboard --logdir={tensorboard_dir}")
         sys.stdout.flush()
-
     except Exception as e:
         print(f"[ERROR] Failed to create PPO model: {e}")
         sys.stdout.flush()
         raise
 
+    # Training of the model
+    print("[10] Starting training")
+    print("[11] Training results will be logged to: ppo_training_log##.csv")
+    sys.stdout.flush()
+
     try:
-        # Create callbacks
-        enhanced_callback = EnhancedLogging(
-            csv_filename="Trained csvs/ppo_training_log_enhanced.csv",
-            tensorboard_log=tensorboard_dir,
-            verbose=1
-        )
-
-        # Optional: Evaluation callback
-        eval_callback = EvalCallback(
-            vec_env,
-            best_model_save_path=models_dir,
-            log_path=tensorboard_dir,
-            eval_freq=5000,
-            n_eval_episodes=10,
-            deterministic=True,
-            verbose=1
-        )
-
-        print("[9] Starting model training...")
-        print(f"[9.1] View with: tensorboard --logdir={tensorboard_dir}")
-        sys.stdout.flush()
+        csv_callback = EnhancedLogging(csv_filename="ppo_training_log71.csv", tensorboard_log=tensorboard_dir)
 
         model.learn(
-            total_timesteps=1000000,
-            callback=[enhanced_callback, eval_callback],
-            log_interval=10,
-            progress_bar=True,
+            total_timesteps=1000000, # Important for how long you want to train the model for
+            callback=csv_callback,
+            log_interval=10
         )
-
-        print("[10] Model training completed successfully!")
+        print("[12] Model was trained succesful")
         sys.stdout.flush()
-
-        # Save model and normalization stats
-        model.save(f"ppo_flp_agent_{timestamp}.zip")
-        vec_env.save(f"ppo_flp_agent_vecnorm_{timestamp}.pkl")
-        print(f"[11] Model saved: ppo_flp_agent_{timestamp}.zip")
-        print(f"[12] VecNorm saved: ppo_flp_agent_vecnorm_{timestamp}.pkl")
-        sys.stdout.flush()
-
     except Exception as e:
         print(f"[ERROR] Training failed: {e}")
         sys.stdout.flush()
@@ -993,10 +926,10 @@ if __name__ == "__main__":
     sys.stdout.flush()
 
     try:
-        model.save("C:/Users/beunk/PycharmProjects/PythonProject1/ppo_flp_agent10.zip")
-        vec_env.save("ppo_flp_agent_vecnorm10.pkl")
-        print("✓ Saved VecNormalize statistics")
-        print("[14] Model saved as 'ppo_flp_agent10'")
+        model.save("ppo_flp_agent")
+        vec_env.save("ppo_flp_agent_vecnorm.pkl")
+        print("Saved VecNormalize statistics")
+        print("[14] Model saved as 'ppo_flp_agent'")
         sys.stdout.flush()
     except Exception as e:
         print(f"[ERROR] Failed to save model: {e}")
@@ -1006,8 +939,8 @@ if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("Training is completed")
     print("=" * 60)
-    print("\n📊 Results saved to:")
-    print("  ✓ ppo_training_log##.csv")
+    print("\nResults saved to:")
+    print("ppo_training_log##.csv")
     print("=" * 60)
 
     # testing the trained model
@@ -1018,7 +951,7 @@ if __name__ == "__main__":
     # Load the trained model
     print("[16] Loading trained model and normalization statistics")
     try:
-        model = PPO.load("C:/Users/beunk/PycharmProjects/PythonProject1/ppo_flp_agent10.zip")
+        model = PPO.load("C:/Users/beunk/PycharmProjects/PythonProject1/ppo_flp_agent.zip")
         print("[17] Model loaded successfully.")
         sys.stdout.flush()
     except Exception as e:
@@ -1046,7 +979,7 @@ if __name__ == "__main__":
         return distances
 
 
-    def test_with_warm_starts(num_episodes=5000, max_steps=200):
+    def test_with_warm_starts(num_episodes=2000, max_steps=200):
         print(f"\n[18] Testing with warm-start optimization ({num_episodes} episodes)...")
         sys.stdout.flush()
 
@@ -1066,7 +999,7 @@ if __name__ == "__main__":
         test_vec_env = DummyVecEnv([make_test_env])
 
         try:
-            test_vec_env = VecNormalize.load("ppo_flp_agent_vecnorm10.pkl", test_vec_env)
+            test_vec_env = VecNormalize.load("ppo_flp_agent_vecnorm.pkl", test_vec_env)
             test_vec_env.training = False
             test_vec_env.norm_reward = False
             print("[18.1] VecNormalize statistics loaded")
@@ -1086,22 +1019,24 @@ if __name__ == "__main__":
                 action, _ = model.predict(obs, deterministic=True)
                 obs, reward, done, info = test_vec_env.step(action)
 
-                env = test_vec_env.envs[0].env
-                true_step_cost = env._calculate_material_handling_cost()
-                episode_costs.append(true_step_cost)
+                current_cost = info[0].get('cost', 0)
+                episode_costs.append(current_cost)
 
                 if done[0]:
                     break
 
             # Record the BEST cost achieved during this episode
-            env = test_vec_env.envs[0].env
-            final_layout = env.current_layout.copy()
-            final_cost = env._calculate_material_handling_cost()
+            best_episode_cost = min(episode_costs) if episode_costs else episode_costs[-1]
+            final_layout = test_vec_env.envs[0].env.current_layout.copy()
+
+            if best_episode_cost < best_cost_seen:
+                best_cost_seen = best_episode_cost
+                best_layout_seen = final_layout.copy()
 
             results.append({
                 'episode': episode + 1,
                 'layout': final_layout,
-                'final_cost': final_cost,
+                'final_cost': best_episode_cost,
                 'total_reward': sum(episode_costs)
             })
 
@@ -1117,6 +1052,7 @@ if __name__ == "__main__":
     # test the model based on the scenario: num_episodes important as to how many times the model is tested
     def test_on_scenario(num_episodes=200000, max_steps=200):
         print(f"\n[18] Testing on regular flow scenario ({num_episodes} episodes)...")
+        print("[18.1] Tracking ONLY FINAL layout costs per episode")
         sys.stdout.flush()
 
         stations_df = shared_data["Stations"]
@@ -1138,54 +1074,58 @@ if __name__ == "__main__":
 
         # Load the saved VecNormalize statistics from training
         try:
-            test_vec_env = VecNormalize.load("ppo_flp_agent_vecnorm10.pkl", test_vec_env)
-            # Set training=False and norm_reward=False for testing
+            test_vec_env = VecNormalize.load("ppo_flp_agent_vecnorm.pkl", test_vec_env)
+            # CRITICAL: Set training=False and norm_reward=False for testing
             test_vec_env.training = False
             test_vec_env.norm_reward = False
-            print("[18.1] VecNormalize statistics loaded successfully")
+            print("[18.2] VecNormalize statistics loaded successfully")
         except Exception as e:
             print(f"[WARNING] Could not load VecNormalize stats: {e}")
-            print("[18.2] Continuing without normalization (results may be suboptimal)")
+            print("[18.3] Continuing without normalization (results may be suboptimal)")
 
         results = []
 
         for episode in range(num_episodes):
             obs = test_vec_env.reset()
             episode_reward = 0
-            episode_cost = 0
             done = False
             step_count = 0
 
+            # Run through entire episode WITHOUT tracking intermediate costs
             while not done and step_count < max_steps:
                 action, _ = model.predict(obs, deterministic=True)
                 obs, reward, done, info = test_vec_env.step(action)
 
                 episode_reward += reward[0]
-                env = test_vec_env.envs[0].env
-                final_cost = env._calculate_material_handling_cost()
                 step_count += 1
 
                 # Check if episode terminated
                 done = done[0]
 
-            # Extract the actual environment to get layout
+            # ONLY calculate cost ONCE at the end of the episode
+            final_cost = test_vec_env.envs[0].env._calculate_material_handling_cost()
             final_layout = test_vec_env.envs[0].env.current_layout.copy()
 
             results.append({
                 'episode': episode + 1,
                 'layout': final_layout,
-                'final_cost': final_cost,
+                'final_cost': final_cost,  # This is the ONLY cost we track
                 'total_reward': episode_reward
             })
 
-            if (episode + 1) % 20 == 0:
-                print(f"[19] Episode {episode + 1}/{num_episodes} completed.")
+            if (episode + 1) % 50 == 0:  # Changed from 20 to 50 for less output
+                avg_cost = np.mean([r['final_cost'] for r in results[-50:]])
+                print(f"[19] Episode {episode + 1}/{num_episodes}")
                 sys.stdout.flush()
 
         test_vec_env.close()
 
         # Sort results by final cost (ascending)
         results.sort(key=lambda x: x['final_cost'])
+
+        print("\n" + "=" * 60)
+        print(f"[20] Testing complete - tracked {num_episodes} FINAL layout costs")
+        print("=" * 60)
         return results
 
 
