@@ -22,6 +22,11 @@ import itertools
 
 # This class uses base callback from SB3 to write the results during each training step
 class EnhancedLogging(BaseCallback):
+    """
+    Enhanced callback for logging training progress to both CSV and TensorBoard.
+    Tracks material handling costs, rewards, and learning rates.
+    """
+
     def __init__(self, csv_filename="ppo_training_log.csv",
                  tensorboard_log="./tensorboard_logs/", verbose=0):
         super().__init__(verbose)
@@ -132,8 +137,7 @@ class ContinuousIrregularFLPEnv(gym.Env):
                  render_mode = None,
                  seed: int = None,
                  excel_data=None,
-                 fixed_scenario=None,
-                 initial_layout=None):
+                 fixed_scenario=None):
 
         super().__init__()
 
@@ -264,8 +268,6 @@ class ContinuousIrregularFLPEnv(gym.Env):
         # S8-S11 were separated into parts of the packaging machines. Creating an additional parameter for close placement
         self.connected_line = [8, 9, 10, 11]
         self.connected_line_spacing = 0.0
-
-        self.initial_layout = initial_layout
 
         # creating the action space dictionary, because facilityID is discrete and placement should be continuous
         # both x and y coordinates of the facilities can be moved in a continuous action space ranging from -1 until 1
@@ -514,14 +516,7 @@ class ContinuousIrregularFLPEnv(gym.Env):
 
         # set everything to default after a reset
         self.current_facility_idx = 0
-        if self.initial_layout is not None:
-            self.current_layout = self.initial_layout.copy()
-            self.baseline_cost = self._calculate_material_handling_cost()
-        else:
-            self.current_layout = self._generate_random_layout()
-            self.baseline_cost = float('inf')
-
-        self.initial_baseline_cost = self.baseline_cost  # Immutable reference
+        self.current_layout = self._generate_random_layout()
 
         self.previous_cost = self._calculate_material_handling_cost()
         obs = self.get_observation()
@@ -567,14 +562,12 @@ class ContinuousIrregularFLPEnv(gym.Env):
         # Compute new cost
         cost_after = self._calculate_material_handling_cost()
 
-        reward = (cost_before - cost_after) / 1000000
-
-        if cost_after < self.baseline_cost:
-            reward += 0.5  # Significant bonus for finding something better
+        # Reward: scaled cost improvement
+        reward = (cost_before - cost_after) / 1e6  # scale to manageable range
 
         # Small penalty for invalid actions
         if invalid_move:
-            reward -= 0.5
+            reward -= 0.1
 
         # Move to next facility (cyclic)
         self.current_facility_idx = (self.current_facility_idx + 1) % self.n_facilities
@@ -810,38 +803,15 @@ if __name__ == "__main__":
 
 
     def make_env():
-        # Re-extract stations data inside make_env for consistency
         stations_df = shared_data["Stations"]
         station_refs = [s for s in stations_df["Number"] if str(s).startswith("S")]
 
-        # Use the provided preset layout
-        preset_layout = {
-            0: (19.5, 10.2, 0.8, 0.8, 0),
-            1: (17.5, 9.7, 1, 1, 0),
-            2: (6.4, 7.8, 1.5, 3, 0),
-            3: (11.6, 6.1, 0.9, 0.6, 0),
-            4: (6.8, 5.0, 1.3, 0.4, 0),
-            5: (10.8, 11.8, 10.6, 1.96, 0),
-            6: (10.8, 7.3, 7.04, 1.98, 0),
-            7: (12.1, 24.4, 2.06, 1.8, 0),
-            8: (23.0, 2.0, 2.7, 12.5, 0),
-            9: (19.4, 2.0, 3.6, 2.0, 0),
-            10: (17.6, 1.85, 1.8, 2.8, 0),
-            11: (5.2, 3.8, 12.3, 1.0, 0),
-            12: (14.2, 17.3, 8.5, 5.5, 0),
-            13: (12.1, 31.0, 7.0, 7.0, 0),
-            14: (25.2, 36.3, 3.8, 3.0, 0),
-            15: (19.6, 29.9, 5.3, 2.5, 0),
-            16: (21.7, 38.6, 3, 1, 0)
-        }
-
         base_env = ContinuousIrregularFLPEnv(
             n_facilities=len(station_refs),
-            excel_data=shared_data,
+            excel_data=shared_data,  # you called this 'shared_data', not 'preprocessed_data'
             render_mode=None,
             fixed_scenario=None,
-            seed=None,
-            initial_layout=preset_layout
+            seed=None
         )
         return PPOCompatibleEnv(base_env)
 
@@ -857,7 +827,7 @@ if __name__ == "__main__":
     try:
         # Preferred parallelization
         vec_env = SubprocVecEnv([make_env for _ in range(6)])
-        vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=False, clip_reward=10.0)
+        vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, clip_reward=10.0)
         print("[7] SubprocVecEnv successfully created")
     except Exception as e:
         print("[7] SubprocVecEnv failed on Windows, switching to DummyVecEnv")
@@ -907,7 +877,7 @@ if __name__ == "__main__":
     sys.stdout.flush()
 
     try:
-        csv_callback = EnhancedLogging(csv_filename="ppo_training_log71.csv", tensorboard_log=tensorboard_dir)
+        csv_callback = EnhancedLogging(csv_filename="ppo_training_log70.csv", tensorboard_log=tensorboard_dir)
 
         model.learn(
             total_timesteps=1000000, # Important for how long you want to train the model for
@@ -928,7 +898,7 @@ if __name__ == "__main__":
     try:
         model.save("ppo_flp_agent")
         vec_env.save("ppo_flp_agent_vecnorm.pkl")
-        print("Saved VecNormalize statistics")
+        print("âœ“ Saved VecNormalize statistics")
         print("[14] Model saved as 'ppo_flp_agent'")
         sys.stdout.flush()
     except Exception as e:
@@ -939,8 +909,8 @@ if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("Training is completed")
     print("=" * 60)
-    print("\nResults saved to:")
-    print("ppo_training_log##.csv")
+    print("\nðŸ“Š Results saved to:")
+    print("  âœ“ ppo_training_log##.csv")
     print("=" * 60)
 
     # testing the trained model
@@ -1016,7 +986,7 @@ if __name__ == "__main__":
 
             # Run full episode with deterministic policy
             for step in range(max_steps):
-                action, _ = model.predict(obs, deterministic=True)
+                action, _ = model.predict(obs, deterministic=False)
                 obs, reward, done, info = test_vec_env.step(action)
 
                 current_cost = info[0].get('cost', 0)
@@ -1050,7 +1020,7 @@ if __name__ == "__main__":
 
 
     # test the model based on the scenario: num_episodes important as to how many times the model is tested
-    def test_on_scenario(num_episodes=200000, max_steps=200):
+    def test_on_scenario(num_episodes=400000, max_steps=200):
         print(f"\n[18] Testing on regular flow scenario ({num_episodes} episodes)...")
         print("[18.1] Tracking ONLY FINAL layout costs per episode")
         sys.stdout.flush()
@@ -1115,7 +1085,8 @@ if __name__ == "__main__":
 
             if (episode + 1) % 50 == 0:  # Changed from 20 to 50 for less output
                 avg_cost = np.mean([r['final_cost'] for r in results[-50:]])
-                print(f"[19] Episode {episode + 1}/{num_episodes}")
+                print(f"[19] Episode {episode + 1}/{num_episodes} | "
+                      f"Last 50 avg: {avg_cost / 1_000_000:.2f}M")
                 sys.stdout.flush()
 
         test_vec_env.close()
@@ -1130,7 +1101,7 @@ if __name__ == "__main__":
 
 
     # Test on all scenarios
-    regular_flow_results = test_on_scenario(num_episodes=200000, max_steps=200)
+    regular_flow_results = test_on_scenario(num_episodes=400000, max_steps=200)
 
 
     # Statistical summary
