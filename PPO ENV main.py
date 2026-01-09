@@ -17,16 +17,10 @@ import csv
 from datetime import datetime
 from stable_baselines3.common.vec_env import VecNormalize
 from torch.utils.tensorboard import SummaryWriter
-import random
 import itertools
 
 # This class uses base callback from SB3 to write the results during each training step
 class EnhancedLogging(BaseCallback):
-    """
-    Enhanced callback for logging training progress to both CSV and TensorBoard.
-    Tracks material handling costs, rewards, and learning rates.
-    """
-
     def __init__(self, csv_filename="ppo_training_log.csv",
                  tensorboard_log="./tensorboard_logs/", verbose=0):
         super().__init__(verbose)
@@ -83,7 +77,7 @@ class EnhancedLogging(BaseCallback):
                 except Exception:
                     reward = None
 
-            # Scale costs if needed
+            # Scale costs
             if cost is not None:
                 cost = cost / 10000.0
 
@@ -122,7 +116,7 @@ class EnhancedLogging(BaseCallback):
 
 
 
-#Checks for any immediate errors
+# Checks for any immediate errors
 print("[DEBUG] Script starting...")
 sys.stdout.flush()
 
@@ -137,7 +131,8 @@ class ContinuousIrregularFLPEnv(gym.Env):
                  render_mode = None,
                  seed: int = None,
                  excel_data=None,
-                 fixed_scenario=None):
+                 fixed_scenario=None,
+                 initial_layout=None):
 
         super().__init__()
 
@@ -219,7 +214,7 @@ class ContinuousIrregularFLPEnv(gym.Env):
         station_refs = [s for s in stations_df["Number"] if str(s).startswith("S")]
         entry_refs = [idx for idx in regular_flow_df.index if str(idx).startswith("E")]
 
-        # Incase there are non values in the flow matrices, then they are filled with 0
+        # Incase there are no vlaues in the flow matrices, then they are filled with 0
         def clean_flow(df):
             return df.loc[
                 [r for r in df.index if str(r).startswith(("S", "E"))],
@@ -268,6 +263,9 @@ class ContinuousIrregularFLPEnv(gym.Env):
         # S8-S11 were separated into parts of the packaging machines. Creating an additional parameter for close placement
         self.connected_line = [8, 9, 10, 11]
         self.connected_line_spacing = 0.0
+        self.min_buffer_zone = 0.75
+
+        self.initial_layout = initial_layout
 
         # creating the action space dictionary, because facilityID is discrete and placement should be continuous
         # both x and y coordinates of the facilities can be moved in a continuous action space ranging from -1 until 1
@@ -279,7 +277,7 @@ class ContinuousIrregularFLPEnv(gym.Env):
             shape=(3,),
             dtype=np.float32
         )
-        # Track which facility to modify in sequence
+        # Set to start at facility id 0
         self.current_facility_idx = 0
 
         # setting the total possible area where the agent can look (so from 0, 0 until the max length and width)
@@ -290,7 +288,7 @@ class ContinuousIrregularFLPEnv(gym.Env):
             dtype=np.float32
         )
 
-        # Initializing variables
+        # Initializing other variables
         self.current_layout = None
         self.step_count = 0
         self.previous_cost = float('inf')
@@ -357,6 +355,8 @@ class ContinuousIrregularFLPEnv(gym.Env):
         if layout is None:
             layout = self.current_layout
 
+        buffer = self.min_buffer_zone  # 0.75m
+
         for other_id, (ox, oy, orig_ol, orig_ow, o_orientation) in layout.items():
             if other_id == facility_id:
                 continue
@@ -367,8 +367,10 @@ class ContinuousIrregularFLPEnv(gym.Env):
             else:
                 other_l, other_w = orig_ol, orig_ow
 
-            overlap = not (x + length <= ox or ox + other_l <= x or
-                           y + width <= oy or oy + other_w <= y)
+            overlap = not (x + length + buffer <= ox - buffer or
+                           ox + other_l + buffer <= x - buffer or
+                           y + width + buffer <= oy - buffer or
+                           oy + other_w + buffer <= y - buffer)
             if overlap:
                 if self.debug_mode:
                     print(f"[DEBUG] Facility {facility_id} overlaps machine {other_id}.")
@@ -379,7 +381,7 @@ class ContinuousIrregularFLPEnv(gym.Env):
         return True
 
     # This function calculates the distances of all machines on average to restricted zones
-    # Needs to be as low as possible
+    # Needs to be as low as possible for optimal real life space usage
     def _calculate_proximity_to_restricted_areas(self):
         rz = np.array(self.restricted_zones)  # Array of the restricted zones
         total_distance = 0.0 # Variable for summing the total distances
@@ -407,7 +409,7 @@ class ContinuousIrregularFLPEnv(gym.Env):
 
         # Connected packaging line constraint
         # Place connected line S8-S11
-        max_initial_spacing = 2.0  # preferred distance
+        max_initial_spacing = 2.0  # preferred distance between machines
         max_expand_spacing = 6.0  # maximum allowed distance if initial fails
         prev_fid = self.connected_line[0]
 
@@ -428,11 +430,12 @@ class ContinuousIrregularFLPEnv(gym.Env):
         if not placed:
             raise RuntimeError(f"Failed to place connected machine {prev_fid} after multiple attempts.")
 
-        # Place remaining connected machines
+        # Place remaining connected packaging machines
         for idx in range(1, len(self.connected_line)):
             fid = self.connected_line[idx]
             l, w = self.machine_dimensions[fid]
 
+            # Determines in which direction to place the connected machines
             placed = False
             for spacing in np.linspace(max_initial_spacing, max_expand_spacing, num=5):
                 directions = ["right", "left", "up", "down"]
@@ -479,7 +482,8 @@ class ContinuousIrregularFLPEnv(gym.Env):
             if not placed:
                 raise RuntimeError(f"Failed to place connected machine {fid} after multiple attempts.")
 
-        # Now place remaining stations as usual
+        # Now place remaining stations separately
+        # Skip the already placed machines
         for i in range(self.n_facilities):
             if i in self.connected_line:
                 continue
@@ -506,18 +510,27 @@ class ContinuousIrregularFLPEnv(gym.Env):
     def reset(self, *, seed=None, options=None):
         # reset feature from gymnasium library taken
         super().reset(seed=seed)
-
-        # self._select_random_flow_scenario()
+        # Can set to a fixed scenario, mainly for testing
         if self.fixed_scenario is not None:
             self.current_scenario = self.fixed_scenario
             self.flow_matrix = self.flow_scenarios[self.current_scenario]["matrix"]
+        # selects a flow matrix based on probabilities
         else:
             self._select_random_flow_scenario()
 
-        # set everything to default after a reset
+        # reset machine placement
         self.current_facility_idx = 0
-        self.current_layout = self._generate_random_layout()
-
+        # Uses provided layout to run the model on
+        if self.initial_layout is not None:
+            self.current_layout = self.initial_layout.copy()
+            self.baseline_cost = self._calculate_material_handling_cost()
+        # otherwise creates a random layout
+        else:
+            self.current_layout = self._generate_random_layout()
+            self.baseline_cost = float('inf')
+        # set baseline cost
+        self.initial_baseline_cost = self.baseline_cost
+        # calculates the cost of the previous layout
         self.previous_cost = self._calculate_material_handling_cost()
         obs = self.get_observation()
         info = {"scenario": self.current_scenario}
@@ -544,7 +557,7 @@ class ContinuousIrregularFLPEnv(gym.Env):
         else:
             l, w = orig_length, orig_width
 
-        # Proposed translation
+        # Propose minimal step size
         STEP_SIZE = 3.0
         new_x = np.clip(x + dx * STEP_SIZE, 0, self.total_length - l)
         new_y = np.clip(y + dy * STEP_SIZE, 0, self.total_width - w)
@@ -562,14 +575,17 @@ class ContinuousIrregularFLPEnv(gym.Env):
         # Compute new cost
         cost_after = self._calculate_material_handling_cost()
 
-        # Reward: scaled cost improvement
-        reward = (cost_before - cost_after) / 1e6  # scale to manageable range
+        # compute a reward based on the relative cost improvement
+        reward = (cost_before - cost_after) / 1000000
+
+        if cost_after < self.baseline_cost:
+            reward += 0.5  # Significant bonus for finding something better
 
         # Small penalty for invalid actions
         if invalid_move:
-            reward -= 0.1
+            reward -= 0.5
 
-        # Move to next facility (cyclic)
+        # Move to next facility
         self.current_facility_idx = (self.current_facility_idx + 1) % self.n_facilities
 
         # Check termination
@@ -590,10 +606,11 @@ class ContinuousIrregularFLPEnv(gym.Env):
         for source in self.flow_matrix.index:
             for target in self.flow_matrix.columns:
                 flow = self.flow_matrix.loc[source, target]
+                # skip the 0 material flows
                 if flow <= 0:
                     continue
 
-                # Set the coordinates of the product source locations
+                # Checks the coordinates of the product source locations for the distance calculation later
                 if str(source).startswith("E"):  # Entry point
                     if source not in self.entry_points_coordinates:
                         continue
@@ -613,7 +630,7 @@ class ContinuousIrregularFLPEnv(gym.Env):
                         continue
                     tx, ty = station_positions[target][0:2]
 
-                # S11 â†’ nearest exit
+                # S11 is end of packaging line where a lot of products leave, searches for nearest product exit point based on location of S11
                 elif str(source) in ["11", "s11"]:
                     # find nearest exit to S11
                     nearest_exit, min_dist = None, float("inf")
@@ -633,31 +650,11 @@ class ContinuousIrregularFLPEnv(gym.Env):
 
         return total_cost
 
-    # check whether the distance between the parts of the packaging conveyor are max 2m placed apart
+    # check whether the distance between the parts of the packaging conveyor are max 2m placed apart (already done by previous functions, hence why it always returns true)
     def _check_conveyor_connectivity(self, layout=None):
         return True
-        if layout is None:
-            layout = self.current_layout
-        max_distance = 2.0  # allowable distance between consecutive machines
-        for i in range(len(self.connected_line) - 1):
-            fid1 = self.connected_line[i]
-            fid2 = self.connected_line[i + 1]
 
-            x1, y1, l1, w1, o1 = layout[fid1]
-            x2, y2, l2, w2, o2 = layout[fid2]
-
-            # compute display dims per orientation
-            dl1, dw1 = (w1, l1) if o1 == 1 else (l1, w1)
-            dl2, dw2 = (w2, l2) if o2 == 1 else (l2, w2)
-
-            cx1, cy1 = x1 + dl1 / 2.0, y1 + dw1 / 2.0
-            cx2, cy2 = x2 + dl2 / 2.0, y2 + dw2 / 2.0
-
-            distance = np.sqrt((cx1 - cx2) ** 2 + (cy1 - cy2) ** 2)
-            if distance > max_distance:
-                return False
-        return True
-    # checks the entire layout based on valid placements
+    # additional check: the entire layout based on valid placements
     def _check_valid_layout(self):
         # Only check restricted zones and placement validity
         for fid, (x, y, orig_l, orig_w, orientation) in self.current_layout.items():
@@ -672,6 +669,7 @@ class ContinuousIrregularFLPEnv(gym.Env):
         # Skip conveyor connectivity check
         return True
 
+    # function makes sure that the agent receives observations of where machines are placed, so it knows in a later step where the previous move was
     def get_observation(self):
         obs = []
         for fid in range(self.n_facilities):
@@ -692,7 +690,7 @@ class ContinuousIrregularFLPEnv(gym.Env):
     def render(self):
         fig, ax = plt.subplots(figsize=(10, 8))
 
-        # Draw irregular area outline
+        # Draw irregular area outline (each coordinate is a corner point)
         irregular_outline = np.array([
             [0, 0],
             [29.1, 0],
@@ -710,7 +708,7 @@ class ContinuousIrregularFLPEnv(gym.Env):
         ax.plot(irregular_outline[:, 0], irregular_outline[:, 1], 'k-', lw=2)
         ax.fill(irregular_outline[:, 0], irregular_outline[:, 1], color='lightgray', alpha=0.3)
 
-        # Draw restricted zones
+        # Visualize restricted zones
         for (rx, ry, rl, rw) in self.restricted_zones:
             rect = Rectangle((rx, ry), rl, rw, color='red', alpha=0.5)
             ax.add_patch(rect)
@@ -739,7 +737,7 @@ class ContinuousIrregularFLPEnv(gym.Env):
         ax.set_aspect('equal')
         ax.set_title(f"Irregular Layout - Step {self.step_count}")
 
-        # When mode is set to rgb, the programme will internally draw rgb images that will be automatically closed again for computational reasons
+        # When mode is set to rgb, the programme will internally draw rgb images that will be instantly closed again for computational reasons
         if self.render_mode == "rgb_array":
             fig.canvas.draw()
             img = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
@@ -755,6 +753,7 @@ class ContinuousIrregularFLPEnv(gym.Env):
 # This class makes sure that the environment is made compatible to be used by the PPO agent
 class PPOCompatibleEnv(gym.Env):
     def __init__(self, env):
+        # fetches the environment compatibility functions
         super().__init__()
         self.env = env
         self.observation_space = env.observation_space
@@ -803,15 +802,38 @@ if __name__ == "__main__":
 
 
     def make_env():
+        # Re-extract stations data inside make_env for consistency
         stations_df = shared_data["Stations"]
         station_refs = [s for s in stations_df["Number"] if str(s).startswith("S")]
 
+        # Use the provided preset layout (in this case the baseline layout), can be turned on or off dependent on whether a fixed or random starting point is used
+        preset_layout = {
+            0: (19.5, 10.2, 0.8, 0.8, 0),
+            1: (17.5, 9.7, 1, 1, 0),
+            2: (6.4, 7.8, 1.5, 3, 0),
+            3: (11.6, 6.1, 0.9, 0.6, 0),
+            4: (6.8, 5.0, 1.3, 0.4, 0),
+            5: (10.8, 11.8, 10.6, 1.96, 0),
+            6: (10.8, 7.3, 7.04, 1.98, 0),
+            7: (12.1, 24.4, 2.06, 1.8, 0),
+            8: (23.0, 2.0, 2.7, 12.5, 0),
+            9: (19.4, 2.0, 3.6, 2.0, 0),
+            10: (17.6, 1.85, 1.8, 2.8, 0),
+            11: (5.2, 3.8, 12.3, 1.0, 0),
+            12: (14.2, 17.3, 8.5, 5.5, 0),
+            13: (12.1, 31.0, 7.0, 7.0, 0),
+            14: (25.2, 36.3, 3.8, 3.0, 0),
+            15: (19.6, 29.9, 5.3, 2.5, 0),
+            16: (21.7, 38.6, 3, 1, 0)
+        }
+
         base_env = ContinuousIrregularFLPEnv(
             n_facilities=len(station_refs),
-            excel_data=shared_data,  # you called this 'shared_data', not 'preprocessed_data'
-            render_mode=None,
-            fixed_scenario=None,
-            seed=None
+            excel_data=shared_data, # input data
+            render_mode=None, # render_mode can be set to "human" to visualize it for testing
+            fixed_scenario=None, # None = stochastic situation, "low", "regular", "high" can be set for deterministic testing
+            seed=None, # None = random starting seed
+            initial_layout=preset_layout # preset_layout is starting to train with baseline layout, set to None is random generated starting layout
         )
         return PPOCompatibleEnv(base_env)
 
@@ -820,14 +842,14 @@ if __name__ == "__main__":
     sys.stdout.flush()
 
 
-    # Create dummy environments
+    # Create additional environments to increase results and computational speed
     print("[6] Creating 6 parallel environments.")
     sys.stdout.flush()
 
     try:
-        # Preferred parallelization
+        # 6 environments are created, so that 6 steps can be made each cycle
         vec_env = SubprocVecEnv([make_env for _ in range(6)])
-        vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, clip_reward=10.0)
+        vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=False, clip_reward=10.0)
         print("[7] SubprocVecEnv successfully created")
     except Exception as e:
         print("[7] SubprocVecEnv failed on Windows, switching to DummyVecEnv")
@@ -849,6 +871,7 @@ if __name__ == "__main__":
     os.makedirs(tensorboard_dir, exist_ok=True)
 
     try:
+        # hyperparameter settings of the ppo model
         model = PPO(
             "MlpPolicy",
             vec_env,
@@ -864,6 +887,7 @@ if __name__ == "__main__":
             tensorboard_log=tensorboard_dir,
         )
         print("[9] PPO model successfully created")
+        # print tensorboard direction, so can easily be accessed internally
         print(f"[9.1] TensorBoard logs: tensorboard --logdir={tensorboard_dir}")
         sys.stdout.flush()
     except Exception as e:
@@ -877,10 +901,10 @@ if __name__ == "__main__":
     sys.stdout.flush()
 
     try:
-        csv_callback = EnhancedLogging(csv_filename="ppo_training_log70.csv", tensorboard_log=tensorboard_dir)
+        csv_callback = EnhancedLogging(csv_filename="ppo_training_log71.csv", tensorboard_log=tensorboard_dir)
 
         model.learn(
-            total_timesteps=1000000, # Important for how long you want to train the model for
+            total_timesteps=1000000, # Number of training steps
             callback=csv_callback,
             log_interval=10
         )
@@ -898,7 +922,7 @@ if __name__ == "__main__":
     try:
         model.save("ppo_flp_agent")
         vec_env.save("ppo_flp_agent_vecnorm.pkl")
-        print("âœ“ Saved VecNormalize statistics")
+        print("Saved VecNormalize statistics")
         print("[14] Model saved as 'ppo_flp_agent'")
         sys.stdout.flush()
     except Exception as e:
@@ -909,8 +933,8 @@ if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("Training is completed")
     print("=" * 60)
-    print("\nðŸ“Š Results saved to:")
-    print("  âœ“ ppo_training_log##.csv")
+    print("\nResults saved to:")
+    print("ppo_training_log##.csv")
     print("=" * 60)
 
     # testing the trained model
@@ -921,7 +945,7 @@ if __name__ == "__main__":
     # Load the trained model
     print("[16] Loading trained model and normalization statistics")
     try:
-        model = PPO.load("C:/Users/beunk/PycharmProjects/PythonProject1/ppo_flp_agent.zip")
+        model = PPO.load("C:/Users/beunk/PycharmProjects/PythonProject1/ppo_flp_agent.zip") # load from internal file directory
         print("[17] Model loaded successfully.")
         sys.stdout.flush()
     except Exception as e:
@@ -929,6 +953,7 @@ if __name__ == "__main__":
         sys.stdout.flush()
         raise
 
+    # calculates pairwise distances, used to check the calculation
     def compute_machine_distances(layout):
         distances = []
         ids = sorted(layout.keys())
@@ -961,7 +986,7 @@ if __name__ == "__main__":
                 n_facilities=len(station_refs),
                 excel_data=shared_data,
                 render_mode="rgb_array",
-                fixed_scenario="regular",
+                fixed_scenario=None,
                 max_steps=max_steps
             )
             return PPOCompatibleEnv(base_env)
@@ -986,7 +1011,7 @@ if __name__ == "__main__":
 
             # Run full episode with deterministic policy
             for step in range(max_steps):
-                action, _ = model.predict(obs, deterministic=False)
+                action, _ = model.predict(obs, deterministic=True)
                 obs, reward, done, info = test_vec_env.step(action)
 
                 current_cost = info[0].get('cost', 0)
@@ -1020,7 +1045,7 @@ if __name__ == "__main__":
 
 
     # test the model based on the scenario: num_episodes important as to how many times the model is tested
-    def test_on_scenario(num_episodes=400000, max_steps=200):
+    def test_on_scenario(num_episodes=5000, max_steps=200):
         print(f"\n[18] Testing on regular flow scenario ({num_episodes} episodes)...")
         print("[18.1] Tracking ONLY FINAL layout costs per episode")
         sys.stdout.flush()
@@ -1028,13 +1053,13 @@ if __name__ == "__main__":
         stations_df = shared_data["Stations"]
         station_refs = [s for s in stations_df["Number"] if str(s).startswith("S")]
 
-        # Create base environment
+        # Create test environment
         def make_test_env():
             base_env = ContinuousIrregularFLPEnv(
                 n_facilities=len(station_refs),
                 excel_data=shared_data,
                 render_mode="rgb_array",
-                fixed_scenario="regular",
+                fixed_scenario=None,
                 max_steps=max_steps
             )
             return PPOCompatibleEnv(base_env)
@@ -1045,7 +1070,7 @@ if __name__ == "__main__":
         # Load the saved VecNormalize statistics from training
         try:
             test_vec_env = VecNormalize.load("ppo_flp_agent_vecnorm.pkl", test_vec_env)
-            # CRITICAL: Set training=False and norm_reward=False for testing
+            # Set training=False and norm_reward=False for testing
             test_vec_env.training = False
             test_vec_env.norm_reward = False
             print("[18.2] VecNormalize statistics loaded successfully")
@@ -1061,7 +1086,7 @@ if __name__ == "__main__":
             done = False
             step_count = 0
 
-            # Run through entire episode WITHOUT tracking intermediate costs
+            # Run through entire episode without tracking intermediate costs (preserves testing speed)
             while not done and step_count < max_steps:
                 action, _ = model.predict(obs, deterministic=True)
                 obs, reward, done, info = test_vec_env.step(action)
@@ -1072,7 +1097,7 @@ if __name__ == "__main__":
                 # Check if episode terminated
                 done = done[0]
 
-            # ONLY calculate cost ONCE at the end of the episode
+            # Calculate layout cost at the end of the episode
             final_cost = test_vec_env.envs[0].env._calculate_material_handling_cost()
             final_layout = test_vec_env.envs[0].env.current_layout.copy()
 
@@ -1083,10 +1108,9 @@ if __name__ == "__main__":
                 'total_reward': episode_reward
             })
 
-            if (episode + 1) % 50 == 0:  # Changed from 20 to 50 for less output
+            if (episode + 1) % 50 == 0:
                 avg_cost = np.mean([r['final_cost'] for r in results[-50:]])
-                print(f"[19] Episode {episode + 1}/{num_episodes} | "
-                      f"Last 50 avg: {avg_cost / 1_000_000:.2f}M")
+                print(f"[19] Episode {episode + 1}/{num_episodes}")
                 sys.stdout.flush()
 
         test_vec_env.close()
@@ -1101,7 +1125,7 @@ if __name__ == "__main__":
 
 
     # Test on all scenarios
-    regular_flow_results = test_on_scenario(num_episodes=400000, max_steps=200)
+    regular_flow_results = test_on_scenario(num_episodes=5000, max_steps=200)
 
 
     # Statistical summary
@@ -1109,8 +1133,8 @@ if __name__ == "__main__":
     rewards = [r['total_reward'] for r in regular_flow_results]
 
     print("\n [20]Statistical Summary:")
-    print(f"Costs (in millions): Mean = {np.mean(costs)/1_000_000:.2f}, Median = {np.median(costs)/1_000_000:.2f}, "
-          f"Std = {np.std(costs)/1_000_000:.2f}, Min = {np.min(costs)/1_000_000:.2f}, Max = {np.max(costs)/1_000_000:.2f}")
+    print(f"Costs (in millions): Mean = {np.mean(costs)/ 1000000:.2f}, Median = {np.median(costs)/1000000:.2f}, "
+          f"Std = {np.std(costs)/1_000_000:.2f}, Min = {np.min(costs)/1000000:.2f}, Max = {np.max(costs)/1000000:.2f}")
     print(f"Rewards: Mean = {np.mean(rewards):.4f}, Median = {np.median(rewards):.4f}, "
           f"Std = {np.std(rewards):.4f}, Min = {np.min(rewards):.4f}, Max = {np.max(rewards):.4f}")
 
@@ -1120,7 +1144,7 @@ if __name__ == "__main__":
     print("Visualizing top 5 results graphically")
     print("=" * 60)
 
-
+    # function for visually outputting the layouts
     def render_layout_human(scenario_name, layout, final_cost, total_reward, env, rank=None):
         print(f"\n[21] Displaying layout for regular flow scenario (Rank #{rank})...")
         print(f"[21] Final Cost: {final_cost / 1_000_000:.4f}M | Total Reward: {total_reward:.4f}")
@@ -1196,7 +1220,7 @@ if __name__ == "__main__":
         n_facilities=len(station_refs),
         excel_data=shared_data,
         render_mode="human",
-        fixed_scenario="regular"
+        fixed_scenario=None
     )
 
     # Sort and select top 5 by lowest cost
