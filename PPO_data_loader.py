@@ -19,11 +19,6 @@ class data_loader:
         extracted_data["Stations"] = Machine_df
         Flow_matrix_df = pd.read_excel(self.file, "Liver flow matrix (normalized)", index_col=0, engine="openpyxl")
         extracted_data["Test flow matrix"] = Flow_matrix_df
-        #flow_references = list(Flow_matrix_df.columns)
-        #print(flow_references)
-        #print("the machine sheet: ", "\n", Machine_df.head())
-        #print(100*"-")
-        #print("flow matrix: ", "\n", Flow_matrix_df.head())
         return extracted_data
 
 
@@ -32,4 +27,5 @@ if __name__ == "__main__":
 
     tester = data_loader(excel_path)
     sheet = tester.excel_file_loading()
+
 
