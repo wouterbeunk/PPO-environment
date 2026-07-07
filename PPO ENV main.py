@@ -875,7 +875,7 @@ if __name__ == "__main__":
         model = PPO(
             "MlpPolicy",
             vec_env,
-            verbose=1,  # Changed from 0 to 1 for more output
+            verbose=1,
             device="cuda",
             batch_size=512,
             n_steps=2048,
